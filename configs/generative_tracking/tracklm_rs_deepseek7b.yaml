@@ -1,0 +1,67 @@
+chapter3_root: /home/lx/chapter3
+detector_cfg_file: /home/lx/chapter3/tools/cfgs/dair_v2x_models/fusion_voxelnext_v2x_xian.yaml
+detector_ckpt: ""
+
+dataset:
+  name: xian
+  split: train
+  object_source: gt
+  detection_paths:
+    train: ""
+    val: ""
+  detection_match_iou: 0.1
+  detection_score_thresh: 0.0
+  K: 3
+  stride: 1
+  max_history_tracks: 32
+  max_current_objects: 64
+  class_names: [Car, Pedestrian, Cyclist, Truck, Bus]
+
+model:
+  use_mock_visual: true
+  use_mock_llm: false
+  feature_source: gt_boxes
+  visual_dim: 128
+  detector_token_dim: 128
+  max_detector_tokens: 256
+  qformer_hidden_size: 128
+  num_queries: 16
+  num_attention_heads: 4
+  llm_hidden_size: 0
+  llm_model_name_or_path: /path/to/deepseek-llm-7b-base
+  llm_torch_dtype: float16
+  llm_trust_remote_code: true
+  llm_low_cpu_mem_usage: true
+  llm_attn_implementation: ""
+  freeze_detector: true
+  freeze_llm: true
+
+prompt:
+  enabled: true
+  max_length: 128
+  template: "Sequence {sequence_id}, frame {frame_id}. Associate current 3D objects to recent history tracks; use NEW for unseen objects."
+
+loss:
+  compute_det_loss: false
+  lambda_id: 1.0
+  id_loss_type: pointer_ce
+  ignore_index: -1
+
+train:
+  batch_size: 1
+  num_workers: 0
+  lr: 0.001
+  max_iters: 100
+  log_interval: 1
+
+eval:
+  batch_size: 1
+  max_lost_frames: 2
+  score_default: 1.0
+
+evaluator:
+  enabled: true
+  iou_threshold: 0.5
+  metrics_path: outputs/tracklm_rs/tracking_metrics.json
+
+output_dir: outputs/tracklm_rs_deepseek7b
