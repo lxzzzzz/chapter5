@@ -15,12 +15,18 @@ from generative_tracking.model import TrackLMRS
 from generative_tracking.runtime import select_device
 from generative_tracking.track_manager import TrackEmbeddingManager
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate minimal TrackLM-RS prototype")
     parser.add_argument("--cfg_file", required=True)
     parser.add_argument("--ckpt", default=None)
     parser.add_argument("--max_frames", type=int, default=None)
+    parser.add_argument("--progress_interval", type=int, default=10)
     parser.add_argument("--output", default=None)
     parser.add_argument("--eval_metrics", action="store_true")
     return parser.parse_args()
@@ -43,6 +49,9 @@ def main() -> None:
     device = select_device(str(cfg.device))
     dataset = SequenceWindowDataset(cfg, split="val")
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=tracklm_collate)
+    total_frames = len(dataset) if args.max_frames is None else min(len(dataset), int(args.max_frames))
+    progress_interval = max(1, int(args.progress_interval))
+    use_tqdm = tqdm is not None
     model = TrackLMRS(cfg).to(device)
     ckpt_arg = args.ckpt if args.ckpt is not None else str(cfg.eval.get("checkpoint", ""))
     ckpt_path = Path(ckpt_arg) if ckpt_arg else Path(cfg.output_dir) / "checkpoints" / "best.pth"
@@ -58,8 +67,11 @@ def main() -> None:
         max_lost_frames=int(cfg.eval.max_lost_frames),
         match_threshold=float(cfg.eval.embedding_match_threshold),
     )
+    if not use_tqdm:
+        print(f"eval progress frames=0/{total_frames}", flush=True)
     outputs = []
     current_sequence = None
+    progress_bar = tqdm(total=total_frames, desc="eval", dynamic_ncols=True, leave=True) if use_tqdm else None
     with torch.inference_mode():
         for frame_count, batch_cpu in enumerate(loader, start=1):
             if args.max_frames is not None and frame_count > args.max_frames:
@@ -88,7 +100,14 @@ def main() -> None:
             del keep, pred_classes, pred_scores, logits, out, batch
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+            if use_tqdm:
+                progress_bar.update(1)
+                progress_bar.set_postfix(frame=f"{frame_count}/{total_frames}")
+            elif frame_count == 1 or frame_count % progress_interval == 0 or frame_count == total_frames:
+                print(f"eval progress frames={frame_count}/{total_frames}", flush=True)
 
+    if progress_bar is not None:
+        progress_bar.close()
     output_path = Path(args.output or Path(cfg.output_dir) / "tracking_results.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:

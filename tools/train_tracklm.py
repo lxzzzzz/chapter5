@@ -5,7 +5,7 @@ import argparse
 import csv
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -16,6 +16,11 @@ from generative_tracking.data import SequenceWindowDataset, tracklm_collate
 from generative_tracking.model import TrackLMRS
 from generative_tracking.runtime import select_device
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train minimal TrackLM-RS prototype")
@@ -24,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_iters", type=int, default=None, help="Optional global step limit for quick debug runs.")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--progress_interval", type=int, default=10)
     parser.add_argument("--save_full_state", action="store_true")
     parser.add_argument("--resume", default=None)
     return parser.parse_args()
@@ -39,6 +45,12 @@ def to_plain(value: Any) -> Any:
     if isinstance(value, list):
         return [to_plain(item) for item in value]
     return value
+
+
+def make_progress(iterable: Iterable, *, total: int, desc: str, enabled: bool):
+    if enabled and tqdm is not None:
+        return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True, leave=True)
+    return iterable
 
 
 def save_checkpoint(
@@ -126,9 +138,11 @@ def main() -> None:
     steps_per_epoch = len(loader)
     max_iters = int(cfg.train.get("max_iters", 0))
     epochs = int(cfg.train.get("epochs", 1))
+    progress_interval = max(1, int(args.progress_interval))
     total_steps = epochs * steps_per_epoch
     if max_iters > 0:
         total_steps = min(total_steps, max_iters)
+    use_tqdm = tqdm is not None
     print(
         f"device={device} samples={len(dataset)} batch_size={int(cfg.train.batch_size)} "
         f"steps_per_epoch={steps_per_epoch} epochs={epochs} total_steps={total_steps} lr={float(cfg.train.lr)}",
@@ -173,7 +187,16 @@ def main() -> None:
     completed_epochs = start_global_step // steps_per_epoch
     best_total = float("inf")
     best_path = checkpoint_dir / "best.pth"
+    overall_bar = make_progress(
+        range(start_global_step, total_steps),
+        total=total_steps,
+        desc="train",
+        enabled=use_tqdm,
+    )
     for epoch in range(completed_epochs + 1, epochs + 1):
+        epoch_target_steps = min(steps_per_epoch, max(0, total_steps - (epoch - 1) * steps_per_epoch))
+        if not use_tqdm:
+            print(f"train progress epoch={epoch}/{epochs} steps={epoch_target_steps}/{steps_per_epoch}", flush=True)
         for step_in_epoch, batch in enumerate(loader, start=1):
             absolute_step = (epoch - 1) * steps_per_epoch + step_in_epoch
             if absolute_step <= start_global_step:
@@ -210,7 +233,24 @@ def main() -> None:
                     best_total=best_total,
                     trainable_only=bool(cfg.train.get("save_trainable_only", True)),
                 )
-                print(f"saved best checkpoint iter={global_step} total={best_total:.4f} path={best_path}", flush=True)
+                if use_tqdm:
+                    overall_bar.write(f"saved best checkpoint iter={global_step} total={best_total:.4f} path={best_path}")
+                else:
+                    print(f"saved best checkpoint iter={global_step} total={best_total:.4f} path={best_path}", flush=True)
+            if use_tqdm:
+                overall_bar.update(1)
+                overall_bar.set_postfix(
+                    epoch=f"{epoch}/{epochs}",
+                    step=f"{step_in_epoch}/{steps_per_epoch}",
+                    total=f"{metrics['total']:.4f}",
+                    cls=f"{metrics['L_cls']:.4f}",
+                )
+            elif global_step == 1 or global_step % progress_interval == 0 or global_step == total_steps:
+                print(
+                    f"train progress iter={global_step}/{total_steps} epoch={epoch}/{epochs} "
+                    f"step={step_in_epoch}/{steps_per_epoch}",
+                    flush=True,
+                )
             if global_step % int(cfg.train.log_interval) == 0:
                 with log_path.open("a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
@@ -230,7 +270,7 @@ def main() -> None:
                             f"{metrics['track_cls_acc']:.6f}",
                         ]
                     )
-                print(
+                msg = (
                     f"epoch={epoch}/{epochs} step={step_in_epoch}/{steps_per_epoch} iter={global_step} "
                     f"L_det={metrics['L_det']:.4f} "
                     f"L_cls={metrics['L_cls']:.4f} "
@@ -240,12 +280,17 @@ def main() -> None:
                     f"L_embed={metrics['L_embed']:.4f} "
                     f"total={metrics['total']:.4f} "
                     f"match_count={metrics['match_count']:.0f} "
-                    f"track_cls_acc={metrics['track_cls_acc']:.4f}",
-                    flush=True,
+                    f"track_cls_acc={metrics['track_cls_acc']:.4f}"
                 )
+                if use_tqdm:
+                    overall_bar.write(msg)
+                else:
+                    print(msg, flush=True)
         if stop_training:
             break
 
+    if use_tqdm:
+        overall_bar.close()
     print(f"finished training iter={global_step} best_total={best_total:.4f} checkpoint={best_path}", flush=True)
 
 
