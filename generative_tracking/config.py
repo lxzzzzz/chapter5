@@ -98,6 +98,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "lr": 0.001,
         "max_iters": 100,
         "log_interval": 1,
+        "save_interval": 1000,
+        "resume": "",
     },
     "eval": {
         "batch_size": 1,
@@ -105,6 +107,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "score_default": 1.0,
         "score_thresh": 0.3,
         "embedding_match_threshold": 0.5,
+        "checkpoint": "",
     },
     "output_dir": "outputs/tracklm_rs",
 }

@@ -19,6 +19,7 @@ from generative_tracking.track_manager import TrackEmbeddingManager
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate minimal TrackLM-RS prototype")
     parser.add_argument("--cfg_file", required=True)
+    parser.add_argument("--ckpt", default=None)
     parser.add_argument("--max_frames", type=int, default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--eval_metrics", action="store_true")
@@ -29,6 +30,13 @@ def move_to_device(batch: dict, device: torch.device) -> dict:
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
 
+def load_model_checkpoint(path: Path, model: torch.nn.Module, device: torch.device) -> int:
+    checkpoint = torch.load(path, map_location=device)
+    state_dict = checkpoint.get("model_state", checkpoint)
+    model.load_state_dict(state_dict)
+    return int(checkpoint.get("iter", 0)) if isinstance(checkpoint, dict) else 0
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.cfg_file)
@@ -36,6 +44,15 @@ def main() -> None:
     dataset = SequenceWindowDataset(cfg, split="val")
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=tracklm_collate)
     model = TrackLMRS(cfg).to(device)
+    ckpt_arg = args.ckpt if args.ckpt is not None else str(cfg.eval.get("checkpoint", ""))
+    ckpt_path = Path(ckpt_arg) if ckpt_arg else Path(cfg.output_dir) / "checkpoints" / "latest.pth"
+    if ckpt_path.exists():
+        ckpt_iter = load_model_checkpoint(ckpt_path, model, device)
+        print(f"loaded checkpoint={ckpt_path} iter={ckpt_iter}")
+    elif args.ckpt is not None or ckpt_arg:
+        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+    else:
+        print(f"warning: checkpoint not found at {ckpt_path}; evaluating randomly initialized model")
     model.eval()
     manager = TrackEmbeddingManager(
         max_lost_frames=int(cfg.eval.max_lost_frames),
