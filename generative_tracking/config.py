@@ -95,8 +95,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "train": {
         "batch_size": 2,
         "num_workers": 0,
-        "lr": 0.001,
-        "max_iters": 100,
+        "lr": 0.0001,
+        "epochs": 1,
+        "max_iters": 0,
         "log_interval": 1,
         "save_interval": 1000,
         "resume": "",
