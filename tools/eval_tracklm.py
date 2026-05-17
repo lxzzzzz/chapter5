@@ -85,6 +85,9 @@ def main() -> None:
                 valid_mask=keep.detach().cpu(),
             )
             outputs.append(result)
+            del keep, pred_classes, pred_scores, logits, out, batch
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     output_path = Path(args.output or Path(cfg.output_dir) / "tracking_results.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
