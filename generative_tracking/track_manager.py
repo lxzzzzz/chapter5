@@ -5,11 +5,13 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 @dataclass
 class TrackState:
     track_id: int
+    embedding: torch.Tensor
     box3d: list[float]
     class_name: str
     score: float
@@ -17,9 +19,12 @@ class TrackState:
     state: str = "active"
 
 
-class TrackManager:
-    def __init__(self, max_lost_frames: int = 2, start_id: int = 0):
+class TrackEmbeddingManager:
+    """Online ID assignment from generated track embeddings."""
+
+    def __init__(self, max_lost_frames: int = 2, match_threshold: float = 0.5, start_id: int = 0):
         self.max_lost_frames = int(max_lost_frames)
+        self.match_threshold = float(match_threshold)
         self.next_id = int(start_id)
         self.tracks: dict[int, TrackState] = {}
 
@@ -32,46 +37,49 @@ class TrackManager:
         sequence_id: str,
         frame_id: str,
         boxes: torch.Tensor | np.ndarray,
+        class_ids: torch.Tensor | np.ndarray,
         class_names: list[str],
         scores: torch.Tensor | np.ndarray,
-        pointer_preds: torch.Tensor | np.ndarray,
-        history_track_ids: torch.Tensor | np.ndarray,
-        history_valid_mask: torch.Tensor | np.ndarray | None = None,
+        embeddings: torch.Tensor | np.ndarray,
+        valid_mask: torch.Tensor | np.ndarray | None = None,
     ) -> dict[str, Any]:
         boxes_np = _to_numpy(boxes).reshape(-1, 7)
+        class_ids_np = _to_numpy(class_ids).astype(np.int64).reshape(-1)
         scores_np = _to_numpy(scores).reshape(-1)
-        preds_np = _to_numpy(pointer_preds).astype(np.int64).reshape(-1)
-        hist_ids = _to_numpy(history_track_ids).astype(np.int64).reshape(-1)
-        if history_valid_mask is None:
-            hist_valid = hist_ids >= 0
+        embeds = _to_tensor(embeddings).float()
+        if valid_mask is None:
+            valid = np.ones((len(boxes_np),), dtype=bool)
         else:
-            hist_valid = _to_numpy(history_valid_mask).astype(bool).reshape(-1)
+            valid = _to_numpy(valid_mask).astype(bool).reshape(-1)
 
-        previous_tracks = set(self.tracks.keys())
-        assigned: set[int] = set()
+        previous_ids = list(self.tracks.keys())
+        active_ids = [tid for tid, state in self.tracks.items() if state.state == "active"]
+        assigned_tracks: set[int] = set()
         outputs: list[dict[str, Any]] = []
-        for idx, box in enumerate(boxes_np):
-            pred = int(preds_np[idx]) if idx < len(preds_np) else len(hist_ids)
-            if 0 <= pred < len(hist_ids) and hist_valid[pred] and int(hist_ids[pred]) >= 0:
-                track_id = int(hist_ids[pred])
-                self.next_id = max(self.next_id, track_id + 1)
-            else:
+        for obj_idx in range(len(boxes_np)):
+            if not valid[obj_idx]:
+                continue
+            embedding = F.normalize(embeds[obj_idx], dim=0).detach().cpu()
+            track_id = self._match_track(embedding, active_ids, assigned_tracks)
+            if track_id is None:
                 track_id = self._new_id()
-            class_name = class_names[idx] if idx < len(class_names) else "Unknown"
-            score = float(scores_np[idx]) if idx < len(scores_np) else 1.0
+            assigned_tracks.add(track_id)
+            class_id = int(class_ids_np[obj_idx]) if obj_idx < len(class_ids_np) else 0
+            class_name = class_names[class_id] if 0 <= class_id < len(class_names) else "Unknown"
+            score = float(scores_np[obj_idx]) if obj_idx < len(scores_np) else 1.0
             state = TrackState(
                 track_id=track_id,
-                box3d=[float(x) for x in box.tolist()],
+                embedding=embedding,
+                box3d=[float(x) for x in boxes_np[obj_idx].tolist()],
                 class_name=str(class_name),
                 score=score,
                 lost_frames=0,
                 state="active",
             )
             self.tracks[track_id] = state
-            assigned.add(track_id)
             outputs.append(_state_to_json(state))
 
-        for track_id in sorted(previous_tracks - assigned):
+        for track_id in sorted(set(previous_ids) - assigned_tracks):
             if track_id not in self.tracks:
                 continue
             state = self.tracks[track_id]
@@ -80,11 +88,19 @@ class TrackManager:
             if state.lost_frames > self.max_lost_frames:
                 del self.tracks[track_id]
 
-        return {
-            "sequence_id": sequence_id,
-            "frame_id": frame_id,
-            "tracks": outputs,
-        }
+        return {"sequence_id": sequence_id, "frame_id": frame_id, "tracks": outputs}
+
+    def _match_track(self, embedding: torch.Tensor, active_ids: list[int], assigned_tracks: set[int]) -> int | None:
+        best_id = None
+        best_score = self.match_threshold
+        for track_id in active_ids:
+            if track_id in assigned_tracks or track_id not in self.tracks:
+                continue
+            score = float(torch.dot(embedding, self.tracks[track_id].embedding))
+            if score > best_score:
+                best_score = score
+                best_id = track_id
+        return best_id
 
     def _new_id(self) -> int:
         while self.next_id in self.tracks:
@@ -98,6 +114,12 @@ def _to_numpy(value: torch.Tensor | np.ndarray) -> np.ndarray:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().numpy()
     return np.asarray(value)
+
+
+def _to_tensor(value: torch.Tensor | np.ndarray) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    return torch.as_tensor(value)
 
 
 def _state_to_json(state: TrackState) -> dict[str, Any]:

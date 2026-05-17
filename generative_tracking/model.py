@@ -31,27 +31,37 @@ class MockVisualFeatureExtractor(nn.Module):
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         frame_tokens = self._encode(batch["window_boxes"], batch["window_class_ids"], batch["window_track_ids"])
-        current_tokens = self._encode(batch["current_boxes"], batch["current_class_ids"], batch["current_track_ids"])
-        history_tokens = self._encode(batch["history_boxes"], batch["history_class_ids"], batch["history_track_ids"])
         frame_tokens = frame_tokens * batch["window_valid_mask"].unsqueeze(-1)
-        current_tokens = current_tokens * batch["current_valid_mask"].unsqueeze(-1)
-        history_tokens = history_tokens * batch["history_valid_mask"].unsqueeze(-1)
         return {
             "frame_tokens": frame_tokens,
-            "current_tokens": current_tokens,
-            "history_tokens": history_tokens,
         }
 
 
 class Chapter3VisualFeatureExtractor(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
+        self.cfg = cfg
+        self.detector_mode = str(cfg.model.get("detector_mode", "cache"))
         self.box_encoder = MockVisualFeatureExtractor(len(cfg.dataset.class_names), int(cfg.model.visual_dim))
         token_dim = int(cfg.model.get("detector_token_dim", cfg.model.visual_dim))
         self.detector_proj = nn.Linear(token_dim, int(cfg.model.visual_dim)) if token_dim != int(cfg.model.visual_dim) else nn.Identity()
+        self.online_detector = None
+        if self.detector_mode == "online":
+            from .chapter3_online import OnlineChapter3Detector
+            self.online_detector = OnlineChapter3Detector(cfg)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         features = self.box_encoder(batch)
+        if self.detector_mode == "online":
+            if self.online_detector is None:
+                raise RuntimeError("online detector was not initialized")
+            detector_tokens, detector_mask = self.online_detector.extract_window_tokens(
+                batch["window_sequence_ids"],
+                batch["window_frame_ids"],
+                device=batch["current_boxes"].device,
+            )
+            batch["detector_frame_tokens"] = detector_tokens
+            batch["detector_frame_valid_mask"] = detector_mask
         if "detector_frame_tokens" not in batch:
             return features
         detector_tokens = self.detector_proj(batch["detector_frame_tokens"])
@@ -163,29 +173,34 @@ class RealFrozenTextLM(nn.Module):
         return output.hidden_states[-1]
 
 
-class PointerIDHead(nn.Module):
-    def __init__(self, token_dim: int, context_dim: int):
+class GenerativeTrackHead(nn.Module):
+    def __init__(self, context_dim: int, num_queries: int, num_classes: int, track_embed_dim: int, num_heads: int):
         super().__init__()
-        self.current_proj = nn.Linear(token_dim, context_dim)
-        self.history_proj = nn.Linear(token_dim, context_dim)
-        self.context_proj = nn.Linear(context_dim, context_dim)
-        self.new_head = nn.Sequential(nn.Linear(context_dim, context_dim), nn.GELU(), nn.Linear(context_dim, 1))
+        self.track_queries = nn.Parameter(torch.randn(num_queries, context_dim) * 0.02)
+        self.attn = nn.MultiheadAttention(context_dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(context_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(context_dim, context_dim * 4),
+            nn.GELU(),
+            nn.Linear(context_dim * 4, context_dim),
+        )
+        self.class_head = nn.Linear(context_dim, num_classes + 1)
+        self.box_head = nn.Sequential(nn.Linear(context_dim, context_dim), nn.GELU(), nn.Linear(context_dim, 7))
+        self.embed_head = nn.Sequential(nn.Linear(context_dim, context_dim), nn.GELU(), nn.Linear(context_dim, track_embed_dim))
+        self.score_head = nn.Linear(context_dim, 1)
 
-    def forward(
-        self,
-        current_tokens: torch.Tensor,
-        history_tokens: torch.Tensor,
-        history_valid_mask: torch.Tensor,
-        lm_context: torch.Tensor,
-    ) -> torch.Tensor:
-        lm_context = lm_context.to(dtype=current_tokens.dtype)
-        context = lm_context.mean(dim=1).unsqueeze(1)
-        current = self.current_proj(current_tokens) + self.context_proj(context)
-        history = self.history_proj(history_tokens)
-        logits_hist = torch.matmul(current, history.transpose(1, 2)) / math.sqrt(current.shape[-1])
-        logits_hist = logits_hist.masked_fill(~history_valid_mask.unsqueeze(1), torch.finfo(logits_hist.dtype).min / 2)
-        logits_new = self.new_head(current)
-        return torch.cat([logits_hist, logits_new], dim=-1)
+    def forward(self, lm_context: torch.Tensor) -> dict[str, torch.Tensor]:
+        bsz = lm_context.shape[0]
+        query = self.track_queries.unsqueeze(0).expand(bsz, -1, -1).to(dtype=lm_context.dtype)
+        attended, _ = self.attn(query, lm_context, lm_context, need_weights=False)
+        x = self.norm(query + attended)
+        x = self.norm(x + self.ffn(x))
+        return {
+            "pred_logits": self.class_head(x),
+            "pred_boxes": self.box_head(x),
+            "pred_track_embeds": F.normalize(self.embed_head(x), dim=-1),
+            "pred_scores": self.score_head(x).sigmoid().squeeze(-1),
+        }
 
 
 class TrackLMRS(nn.Module):
@@ -216,7 +231,13 @@ class TrackLMRS(nn.Module):
             )
         else:
             self.llm = RealFrozenTextLM(cfg, llm_hidden, bool(cfg.model.freeze_llm))
-        self.pointer_head = PointerIDHead(visual_dim, llm_hidden)
+        self.track_head = GenerativeTrackHead(
+            context_dim=llm_hidden,
+            num_queries=int(cfg.model.num_track_queries),
+            num_classes=len(cfg.dataset.class_names),
+            track_embed_dim=int(cfg.model.track_embed_dim),
+            num_heads=int(cfg.model.num_attention_heads),
+        )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
         features = self.visual(batch)
@@ -231,50 +252,137 @@ class TrackLMRS(nn.Module):
             prompt_embeds = prompt_embeds.to(dtype=lm_inputs.dtype)
             lm_inputs = torch.cat([prompt_embeds, lm_inputs], dim=1)
         lm_context = self.llm(lm_inputs)
-        logits = self.pointer_head(
-            features["current_tokens"],
-            features["history_tokens"],
-            batch["history_valid_mask"],
-            lm_context,
-        )
-        out: dict[str, Any] = {"logits": logits, "L_det": logits.new_zeros(())}
-        if "pointer_labels" in batch:
-            loss_id, metrics = pointer_loss_and_metrics(
-                logits,
-                batch["pointer_labels"],
-                batch["current_valid_mask"],
-                ignore_index=int(self.cfg.loss.ignore_index),
-                lambda_id=float(self.cfg.loss.lambda_id),
-            )
+        out = self.track_head(lm_context)
+        out["L_det"] = out["pred_boxes"].new_zeros(())
+        if "target_boxes" in batch:
+            losses, metrics = generative_track_loss(out, batch, self.cfg)
+            out.update(losses)
             out.update(metrics)
-            out["L_id"] = loss_id
-            out["loss"] = out["L_det"] + loss_id
+            out["loss"] = out["L_det"] + out["L_cls"] + out["L_box"] + out["L_embed"]
         return out
 
 
-def pointer_loss_and_metrics(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    current_valid_mask: torch.Tensor,
-    ignore_index: int,
-    lambda_id: float = 1.0,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    valid = current_valid_mask & labels.ne(ignore_index)
-    if not valid.any():
-        zero = logits.sum() * 0.0
-        return zero, {"pointer_acc": zero.detach(), "new_acc": zero.detach()}
-    valid_logits = logits[valid]
-    valid_labels = labels[valid].clamp_max(logits.shape[-1] - 1)
-    loss = F.cross_entropy(valid_logits, valid_labels) * lambda_id
-    pred = valid_logits.argmax(dim=-1)
-    pointer_acc = pred.eq(valid_labels).float().mean()
-    new_index = logits.shape[-1] - 1
-    new_mask = valid_labels.eq(new_index)
-    if new_mask.any():
-        new_acc = pred[new_mask].eq(valid_labels[new_mask]).float().mean()
+def generative_track_loss(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    cfg: Config,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    pred_logits = outputs["pred_logits"]
+    pred_boxes = outputs["pred_boxes"]
+    pred_embeds = outputs["pred_track_embeds"]
+    target_boxes = batch["target_boxes"].to(pred_boxes.device)
+    target_classes = batch["target_class_ids"].to(pred_logits.device)
+    target_track_ids = batch["target_track_ids"].to(pred_logits.device)
+    target_valid = batch["target_valid_mask"].to(pred_logits.device)
+    bsz, num_queries, num_classes_plus_noobj = pred_logits.shape
+    no_object_class = num_classes_plus_noobj - 1
+
+    cls_targets = torch.full((bsz, num_queries), no_object_class, dtype=torch.long, device=pred_logits.device)
+    matched_pred_indices: list[torch.Tensor] = []
+    matched_target_indices: list[torch.Tensor] = []
+    all_matched_embeds: list[torch.Tensor] = []
+    all_matched_track_ids: list[torch.Tensor] = []
+    box_losses: list[torch.Tensor] = []
+    matched_count = 0
+
+    for bidx in range(bsz):
+        valid_idx = torch.where(target_valid[bidx])[0]
+        if len(valid_idx) == 0:
+            matched_pred_indices.append(torch.empty(0, dtype=torch.long, device=pred_logits.device))
+            matched_target_indices.append(torch.empty(0, dtype=torch.long, device=pred_logits.device))
+            continue
+        cur_tgt_boxes = target_boxes[bidx, valid_idx]
+        cur_tgt_classes = target_classes[bidx, valid_idx]
+        pred_prob = pred_logits[bidx].softmax(dim=-1)
+        cls_cost = -pred_prob[:, cur_tgt_classes]
+        box_cost = torch.cdist(pred_boxes[bidx], cur_tgt_boxes, p=1) / pred_boxes.shape[-1]
+        cost = cls_cost + box_cost
+        pred_idx, tgt_local_idx = greedy_min_cost_match(cost.detach())
+        if len(pred_idx) == 0:
+            continue
+        tgt_idx = valid_idx[tgt_local_idx]
+        cls_targets[bidx, pred_idx] = target_classes[bidx, tgt_idx]
+        box_losses.append(F.l1_loss(pred_boxes[bidx, pred_idx], target_boxes[bidx, tgt_idx], reduction="mean"))
+        all_matched_embeds.append(pred_embeds[bidx, pred_idx])
+        all_matched_track_ids.append(target_track_ids[bidx, tgt_idx])
+        matched_pred_indices.append(pred_idx)
+        matched_target_indices.append(tgt_idx)
+        matched_count += int(len(pred_idx))
+
+    class_weights = pred_logits.new_ones((num_classes_plus_noobj,))
+    class_weights[no_object_class] = float(cfg.loss.no_object_weight)
+    l_cls = F.cross_entropy(pred_logits.flatten(0, 1), cls_targets.flatten(), weight=class_weights)
+    l_box = torch.stack(box_losses).mean() if box_losses else pred_boxes.sum() * 0.0
+    if all_matched_embeds:
+        matched_embeds = torch.cat(all_matched_embeds, dim=0)
+        matched_track_ids = torch.cat(all_matched_track_ids, dim=0)
+        l_embed = track_embedding_consistency_loss(matched_embeds, matched_track_ids)
     else:
-        new_acc = logits.new_zeros(())
-    return loss, {"pointer_acc": pointer_acc.detach(), "new_acc": new_acc.detach()}
+        l_embed = pred_embeds.sum() * 0.0
+
+    losses = {
+        "L_cls": l_cls * float(cfg.loss.lambda_cls),
+        "L_box": l_box * float(cfg.loss.lambda_box),
+        "L_embed": l_embed * float(cfg.loss.lambda_embed),
+    }
+    pred_classes = pred_logits.argmax(dim=-1)
+    valid_cls = cls_targets.ne(no_object_class)
+    if valid_cls.any():
+        cls_acc = pred_classes[valid_cls].eq(cls_targets[valid_cls]).float().mean()
+    else:
+        cls_acc = pred_logits.new_zeros(())
+    metrics = {
+        "match_count": pred_logits.new_tensor(float(matched_count)),
+        "track_cls_acc": cls_acc.detach(),
+    }
+    return losses, metrics
+
+
+def greedy_min_cost_match(cost: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if cost.numel() == 0:
+        device = cost.device
+        return torch.empty(0, dtype=torch.long, device=device), torch.empty(0, dtype=torch.long, device=device)
+    num_queries, num_targets = cost.shape
+    order = torch.argsort(cost.flatten())
+    used_q: set[int] = set()
+    used_t: set[int] = set()
+    pred_indices: list[int] = []
+    target_indices: list[int] = []
+    for flat in order.tolist():
+        q = flat // num_targets
+        t = flat % num_targets
+        if q in used_q or t in used_t:
+            continue
+        used_q.add(q)
+        used_t.add(t)
+        pred_indices.append(q)
+        target_indices.append(t)
+        if len(target_indices) >= min(num_queries, num_targets):
+            break
+    device = cost.device
+    return torch.as_tensor(pred_indices, dtype=torch.long, device=device), torch.as_tensor(target_indices, dtype=torch.long, device=device)
+
+
+def track_embedding_consistency_loss(embeds: torch.Tensor, track_ids: torch.Tensor) -> torch.Tensor:
+    valid = track_ids.ge(0)
+    embeds = embeds[valid]
+    track_ids = track_ids[valid]
+    if embeds.shape[0] < 2:
+        return embeds.sum() * 0.0
+    sim = embeds @ embeds.transpose(0, 1)
+    same = track_ids[:, None].eq(track_ids[None, :])
+    eye = torch.eye(len(track_ids), dtype=torch.bool, device=track_ids.device)
+    pos = same & ~eye
+    neg = (~same) & ~eye
+    loss = embeds.sum() * 0.0
+    terms = 0
+    if pos.any():
+        loss = loss + (1.0 - sim[pos]).mean()
+        terms += 1
+    if neg.any():
+        loss = loss + F.relu(sim[neg] - 0.2).mean()
+        terms += 1
+    return loss / max(terms, 1)
 
 
 def resolve_llm_hidden_size(cfg: Config) -> int:

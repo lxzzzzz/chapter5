@@ -16,10 +16,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dataset": {
         "name": "xian",
         "split": "train",
-        "object_source": "gt",
-        "detection_paths": {"train": "", "val": ""},
-        "detection_match_iou": 0.1,
-        "detection_score_thresh": 0.0,
         "datasets": ["xian", "v2x_seq", "v2x_real"],
         "info_paths": {
             "xian": {
@@ -37,20 +33,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "K": 3,
         "stride": 1,
-        "max_history_tracks": 32,
-        "max_current_objects": 64,
+        "max_objects": 64,
         "class_names": ["Car", "Pedestrian", "Cyclist", "Truck", "Bus"],
     },
     "model": {
         "use_mock_visual": True,
         "use_mock_llm": True,
         "feature_source": "gt_boxes",
+        "detector_mode": "cache",
         "visual_dim": 128,
         "detector_token_dim": 128,
         "max_detector_tokens": 256,
+        "online_detector_batch_size": 1,
+        "online_detector_workers": 0,
         "qformer_hidden_size": 128,
         "num_queries": 16,
         "num_attention_heads": 4,
+        "num_track_queries": 64,
+        "track_embed_dim": 128,
         "llm_hidden_size": 0,
         "mock_llm_hidden_size": 128,
         "mock_llm_layers": 2,
@@ -67,7 +67,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_length": 128,
         "template": (
             "Sequence {sequence_id}, frame {frame_id}. "
-            "Associate current 3D objects to recent history tracks; use NEW for unseen objects."
+            "Generate the current 3D track set with object boxes, classes, and temporally consistent identities."
         ),
     },
     "evaluator": {
@@ -77,8 +77,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "loss": {
         "compute_det_loss": False,
-        "lambda_id": 1.0,
-        "id_loss_type": "pointer_ce",
+        "lambda_cls": 1.0,
+        "lambda_box": 5.0,
+        "lambda_embed": 1.0,
+        "no_object_weight": 0.1,
         "ignore_index": -1,
     },
     "train": {
@@ -92,6 +94,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "batch_size": 1,
         "max_lost_frames": 2,
         "score_default": 1.0,
+        "score_thresh": 0.3,
+        "embedding_match_threshold": 0.5,
     },
     "output_dir": "outputs/tracklm_rs",
 }

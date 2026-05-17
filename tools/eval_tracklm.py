@@ -13,7 +13,7 @@ from generative_tracking.data import SequenceWindowDataset, tracklm_collate
 from generative_tracking.evaluator import evaluate_tracking_json
 from generative_tracking.model import TrackLMRS
 from generative_tracking.runtime import select_device
-from generative_tracking.track_manager import TrackManager
+from generative_tracking.track_manager import TrackEmbeddingManager
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +37,10 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=tracklm_collate)
     model = TrackLMRS(cfg).to(device)
     model.eval()
-    manager = TrackManager(max_lost_frames=int(cfg.eval.max_lost_frames))
+    manager = TrackEmbeddingManager(
+        max_lost_frames=int(cfg.eval.max_lost_frames),
+        match_threshold=float(cfg.eval.embedding_match_threshold),
+    )
     outputs = []
     current_sequence = None
     with torch.no_grad():
@@ -50,19 +53,19 @@ def main() -> None:
                 current_sequence = sequence_id
             batch = move_to_device(batch_cpu, device)
             out = model(batch)
-            logits = out["logits"][0]
-            valid_current = batch_cpu["current_valid_mask"][0]
-            n_current = int(valid_current.sum().item())
-            preds = logits[:n_current].argmax(dim=-1).cpu()
+            logits = out["pred_logits"][0].softmax(dim=-1)
+            no_object = logits.shape[-1] - 1
+            pred_scores, pred_classes = logits[:, :no_object].max(dim=-1)
+            keep = pred_scores.ge(float(cfg.eval.score_thresh))
             result = manager.update(
                 sequence_id=sequence_id,
                 frame_id=batch_cpu["frame_id"][0],
-                boxes=batch_cpu["current_boxes"][0, :n_current],
-                class_names=batch_cpu["current_class_names"][0][:n_current],
-                scores=batch_cpu["current_scores"][0, :n_current],
-                pointer_preds=preds,
-                history_track_ids=batch_cpu["history_track_ids"][0],
-                history_valid_mask=batch_cpu["history_valid_mask"][0],
+                boxes=out["pred_boxes"][0].detach().cpu(),
+                class_ids=pred_classes.detach().cpu(),
+                class_names=list(cfg.dataset.class_names),
+                scores=pred_scores.detach().cpu(),
+                embeddings=out["pred_track_embeds"][0].detach().cpu(),
+                valid_mask=keep.detach().cpu(),
             )
             outputs.append(result)
 

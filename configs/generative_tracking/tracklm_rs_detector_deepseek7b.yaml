@@ -1,34 +1,32 @@
 chapter3_root: /home/lx/chapter3
 detector_cfg_file: /home/lx/chapter3/tools/cfgs/dair_v2x_models/fusion_voxelnext_v2x_xian.yaml
-detector_ckpt: /path/to/chapter3/checkpoint_epoch_xx.pth
+detector_ckpt: /media/ana-4090/LY/chapter3/output/cfgs/exp46/4-10_A7_mths/exp46/4-10/A7/ckpt/checkpoint_epoch_2.pth
 
 dataset:
   name: xian
   split: train
-  object_source: detections
-  detection_paths:
-    train: outputs/chapter3_detections/xian_train.pkl
-    val: outputs/chapter3_detections/xian_val.pkl
-  detection_match_iou: 0.1
-  detection_score_thresh: 0.1
   K: 3
   stride: 1
-  max_history_tracks: 32
-  max_current_objects: 64
+  max_objects: 64
   class_names: [Car]
 
 model:
   use_mock_visual: false
   use_mock_llm: false
-  feature_source: chapter3_detector_tokens
+  feature_source: online_chapter3_detector_tokens
+  detector_mode: online
   visual_dim: 128
   detector_token_dim: 128
   max_detector_tokens: 256
+  online_detector_batch_size: 1
+  online_detector_workers: 0
   qformer_hidden_size: 128
   num_queries: 16
   num_attention_heads: 4
+  num_track_queries: 64
+  track_embed_dim: 128
   llm_hidden_size: 0
-  llm_model_name_or_path: /path/to/deepseek-llm-7b-base
+  llm_model_name_or_path: /media/ana-4090/LY/LLM_models/deepseek-llm-7b-base
   llm_torch_dtype: float16
   llm_trust_remote_code: true
   llm_low_cpu_mem_usage: true
@@ -39,12 +37,14 @@ model:
 prompt:
   enabled: true
   max_length: 128
-  template: "Sequence {sequence_id}, frame {frame_id}. Associate current 3D detections to recent history tracks; use NEW for unseen objects."
+  template: "Sequence {sequence_id}, frame {frame_id}. Generate the current 3D track set with object boxes, classes, and temporally consistent identities."
 
 loss:
   compute_det_loss: false
-  lambda_id: 1.0
-  id_loss_type: pointer_ce
+  lambda_cls: 1.0
+  lambda_box: 5.0
+  lambda_embed: 1.0
+  no_object_weight: 0.1
   ignore_index: -1
 
 train:
@@ -58,6 +58,8 @@ eval:
   batch_size: 1
   max_lost_frames: 2
   score_default: 1.0
+  score_thresh: 0.3
+  embedding_match_threshold: 0.5
 
 evaluator:
   enabled: true

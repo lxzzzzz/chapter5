@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from generative_tracking.config import load_config
-from generative_tracking.data import SequenceWindowDataset, build_history_candidates, build_pointer_labels, frame_to_objects
+from generative_tracking.data import SequenceWindowDataset, frame_to_objects, tracklm_collate
 
 
 def _info(frame_idx, track_ids):
@@ -24,20 +24,16 @@ def _info(frame_idx, track_ids):
 
 
 class TrackLMDataTest(unittest.TestCase):
-    def test_pointer_labels_recent_history_order(self):
-        class_to_id = {"Car": 0}
-        history = [frame_to_objects(_info(0, [5, 8, 12]), class_to_id)]
-        candidates = build_history_candidates(history, max_history_tracks=3)
-        labels = build_pointer_labels(np.asarray([5, 8, 20, 12]), candidates["track_ids"], max_history_tracks=3)
-        self.assertEqual(candidates["track_ids"].tolist(), [5, 8, 12])
-        self.assertEqual(labels.tolist(), [0, 1, 3, 2])
+    def test_frame_to_objects_reads_gt_tracks(self):
+        objects = frame_to_objects(_info(0, [5, 8]), {"Car": 0})
+        self.assertEqual(objects.track_ids.tolist(), [5, 8])
+        self.assertEqual(objects.class_ids.tolist(), [0, 0])
 
-
-    def test_padding_mask_for_early_frame(self):
+    def test_padding_mask_and_targets_for_early_frame(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             info_path = f"{tmpdir}/tracking_infos_train.pkl"
             with open(info_path, "wb") as f:
-                pickle.dump([_info(0, [1]), _info(1, [1])], f)
+                pickle.dump([_info(0, [1]), _info(1, [1, 2])], f)
             cfg = load_config(
                 overrides={
                     "dataset": {
@@ -45,15 +41,17 @@ class TrackLMDataTest(unittest.TestCase):
                         "K": 3,
                         "stride": 1,
                         "info_paths": {"tmp": {"train": info_path, "val": info_path}},
-                        "max_history_tracks": 4,
-                        "max_current_objects": 8,
+                        "max_objects": 8,
                     }
                 }
             )
             dataset = SequenceWindowDataset(cfg, split="train")
             sample = dataset[0]
             self.assertEqual(sample["frame_valid_mask"].tolist(), [False, False, True])
-            self.assertEqual(sample["pointer_labels"].tolist(), [4])
+            self.assertEqual(sample["target_track_ids"].tolist(), [1])
+            batch = tracklm_collate([dataset[1]])
+            self.assertEqual(tuple(batch["target_boxes"].shape), (1, 2, 7))
+            self.assertTrue(batch["target_valid_mask"][0, :2].all())
 
 
 if __name__ == "__main__":

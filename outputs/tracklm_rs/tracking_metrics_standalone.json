@@ -1,0 +1,12 @@
+{
+  "num_gt": 32.0,
+  "num_pred": 32.0,
+  "matches": 32.0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "mota_like": 0.46875,
+  "id_switches": 17.0,
+  "false_positive": 0.0,
+  "false_negative": 0.0,
+  "iou_threshold": 0.5
+}

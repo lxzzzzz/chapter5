@@ -72,10 +72,12 @@ def main() -> None:
             print(
                 f"iter={step} "
                 f"L_det={float(out['L_det'].detach().cpu()):.4f} "
-                f"L_id={float(out['L_id'].detach().cpu()):.4f} "
+                f"L_cls={float(out['L_cls'].detach().cpu()):.4f} "
+                f"L_box={float(out['L_box'].detach().cpu()):.4f} "
+                f"L_embed={float(out['L_embed'].detach().cpu()):.4f} "
                 f"total={float(out['loss'].detach().cpu()):.4f} "
-                f"pointer_acc={float(out['pointer_acc'].detach().cpu()):.4f} "
-                f"new_acc={float(out['new_acc'].detach().cpu()):.4f}",
+                f"match_count={float(out['match_count'].detach().cpu()):.0f} "
+                f"track_cls_acc={float(out['track_cls_acc'].detach().cpu()):.4f}",
                 flush=True,
             )
 
