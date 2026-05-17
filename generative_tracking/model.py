@@ -174,7 +174,15 @@ class RealFrozenTextLM(nn.Module):
 
 
 class GenerativeTrackHead(nn.Module):
-    def __init__(self, context_dim: int, num_queries: int, num_classes: int, track_embed_dim: int, num_heads: int):
+    def __init__(
+        self,
+        context_dim: int,
+        num_queries: int,
+        num_classes: int,
+        track_embed_dim: int,
+        num_heads: int,
+        cfg: Config,
+    ):
         super().__init__()
         self.track_queries = nn.Parameter(torch.randn(num_queries, context_dim) * 0.02)
         self.attn = nn.MultiheadAttention(context_dim, num_heads, batch_first=True)
@@ -188,6 +196,11 @@ class GenerativeTrackHead(nn.Module):
         self.box_head = nn.Sequential(nn.Linear(context_dim, context_dim), nn.GELU(), nn.Linear(context_dim, 7))
         self.embed_head = nn.Sequential(nn.Linear(context_dim, context_dim), nn.GELU(), nn.Linear(context_dim, track_embed_dim))
         self.score_head = nn.Linear(context_dim, 1)
+        center_range = torch.as_tensor(cfg.dataset.box_center_range, dtype=torch.float32)
+        self.register_buffer("center_min", center_range[:3])
+        self.register_buffer("center_extent", (center_range[3:6] - center_range[:3]).clamp_min(1e-3))
+        self.register_buffer("size_scale", torch.as_tensor(cfg.dataset.box_size_scale, dtype=torch.float32).clamp_min(1e-3))
+        self.yaw_scale = float(cfg.dataset.box_yaw_scale)
 
     def forward(self, lm_context: torch.Tensor) -> dict[str, torch.Tensor]:
         lm_context = lm_context.to(dtype=self.track_queries.dtype)
@@ -196,12 +209,32 @@ class GenerativeTrackHead(nn.Module):
         attended, _ = self.attn(query, lm_context, lm_context, need_weights=False)
         x = self.norm(query + attended)
         x = self.norm(x + self.ffn(x))
+        raw_boxes = self.box_head(x)
+        pred_boxes_normalized = torch.cat(
+            [
+                raw_boxes[..., 0:3].sigmoid(),
+                raw_boxes[..., 3:6].sigmoid(),
+                raw_boxes[..., 6:7].tanh(),
+            ],
+            dim=-1,
+        )
+        pred_boxes = self.decode_boxes(pred_boxes_normalized)
         return {
             "pred_logits": self.class_head(x),
-            "pred_boxes": self.box_head(x),
+            "pred_boxes": pred_boxes,
+            "pred_boxes_normalized": pred_boxes_normalized,
             "pred_track_embeds": F.normalize(self.embed_head(x), dim=-1),
             "pred_scores": self.score_head(x).sigmoid().squeeze(-1),
         }
+
+    def decode_boxes(self, boxes_normalized: torch.Tensor) -> torch.Tensor:
+        center_min = self.center_min.to(device=boxes_normalized.device, dtype=boxes_normalized.dtype)
+        center_extent = self.center_extent.to(device=boxes_normalized.device, dtype=boxes_normalized.dtype)
+        size_scale = self.size_scale.to(device=boxes_normalized.device, dtype=boxes_normalized.dtype)
+        xyz = boxes_normalized[..., 0:3] * center_extent + center_min
+        dims = boxes_normalized[..., 3:6] * size_scale
+        yaw = boxes_normalized[..., 6:7] * self.yaw_scale
+        return torch.cat([xyz, dims, yaw], dim=-1)
 
 
 class TrackLMRS(nn.Module):
@@ -238,6 +271,7 @@ class TrackLMRS(nn.Module):
             num_classes=len(cfg.dataset.class_names),
             track_embed_dim=int(cfg.model.track_embed_dim),
             num_heads=int(cfg.model.num_attention_heads),
+            cfg=cfg,
         )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
@@ -259,7 +293,7 @@ class TrackLMRS(nn.Module):
             losses, metrics = generative_track_loss(out, batch, self.cfg)
             out.update(losses)
             out.update(metrics)
-            out["loss"] = out["L_det"] + out["L_cls"] + out["L_box"] + out["L_embed"]
+            out["loss"] = out["L_det"] + out["L_cls"] + out["L_center"] + out["L_size"] + out["L_yaw"] + out["L_embed"]
         return out
 
 
@@ -270,8 +304,11 @@ def generative_track_loss(
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     pred_logits = outputs["pred_logits"]
     pred_boxes = outputs["pred_boxes"]
+    pred_boxes_normalized = outputs["pred_boxes_normalized"]
     pred_embeds = outputs["pred_track_embeds"]
     target_boxes = batch["target_boxes"].to(pred_boxes.device)
+    target_boxes_normalized = normalize_boxes(target_boxes, cfg)
+    target_box_code = encode_boxes_for_loss(target_boxes_normalized)
     target_classes = batch["target_class_ids"].to(pred_logits.device)
     target_track_ids = batch["target_track_ids"].to(pred_logits.device)
     target_valid = batch["target_valid_mask"].to(pred_logits.device)
@@ -283,7 +320,9 @@ def generative_track_loss(
     matched_target_indices: list[torch.Tensor] = []
     all_matched_embeds: list[torch.Tensor] = []
     all_matched_track_ids: list[torch.Tensor] = []
-    box_losses: list[torch.Tensor] = []
+    center_losses: list[torch.Tensor] = []
+    size_losses: list[torch.Tensor] = []
+    yaw_losses: list[torch.Tensor] = []
     matched_count = 0
 
     for bidx in range(bsz):
@@ -292,18 +331,31 @@ def generative_track_loss(
             matched_pred_indices.append(torch.empty(0, dtype=torch.long, device=pred_logits.device))
             matched_target_indices.append(torch.empty(0, dtype=torch.long, device=pred_logits.device))
             continue
-        cur_tgt_boxes = target_boxes[bidx, valid_idx]
+        cur_tgt_boxes = target_boxes_normalized[bidx, valid_idx]
+        cur_tgt_code = target_box_code[bidx, valid_idx]
         cur_tgt_classes = target_classes[bidx, valid_idx]
         pred_prob = pred_logits[bidx].softmax(dim=-1)
+        pred_code = encode_boxes_for_loss(pred_boxes_normalized[bidx])
         cls_cost = -pred_prob[:, cur_tgt_classes]
-        box_cost = torch.cdist(pred_boxes[bidx], cur_tgt_boxes, p=1) / pred_boxes.shape[-1]
-        cost = cls_cost + box_cost
-        pred_idx, tgt_local_idx = greedy_min_cost_match(cost.detach())
+        center_cost = torch.cdist(pred_code[:, 0:3], cur_tgt_code[:, 0:3], p=1) / 3.0
+        size_cost = torch.cdist(pred_code[:, 3:6], cur_tgt_code[:, 3:6], p=1) / 3.0
+        yaw_cost = torch.cdist(pred_code[:, 6:8], cur_tgt_code[:, 6:8], p=1) / 2.0
+        cost = (
+            float(cfg.loss.matching_cls_cost) * cls_cost
+            + float(cfg.loss.matching_center_cost) * center_cost
+            + float(cfg.loss.matching_size_cost) * size_cost
+            + float(cfg.loss.matching_yaw_cost) * yaw_cost
+        )
+        pred_idx, tgt_local_idx = hungarian_min_cost_match(cost.detach())
         if len(pred_idx) == 0:
             continue
         tgt_idx = valid_idx[tgt_local_idx]
         cls_targets[bidx, pred_idx] = target_classes[bidx, tgt_idx]
-        box_losses.append(F.l1_loss(pred_boxes[bidx, pred_idx], target_boxes[bidx, tgt_idx], reduction="mean"))
+        matched_pred_code = encode_boxes_for_loss(pred_boxes_normalized[bidx, pred_idx])
+        matched_tgt_code = target_box_code[bidx, tgt_idx]
+        center_losses.append(F.l1_loss(matched_pred_code[:, 0:3], matched_tgt_code[:, 0:3], reduction="mean"))
+        size_losses.append(F.l1_loss(matched_pred_code[:, 3:6], matched_tgt_code[:, 3:6], reduction="mean"))
+        yaw_losses.append(F.l1_loss(matched_pred_code[:, 6:8], matched_tgt_code[:, 6:8], reduction="mean"))
         all_matched_embeds.append(pred_embeds[bidx, pred_idx])
         all_matched_track_ids.append(target_track_ids[bidx, tgt_idx])
         matched_pred_indices.append(pred_idx)
@@ -313,7 +365,9 @@ def generative_track_loss(
     class_weights = pred_logits.new_ones((num_classes_plus_noobj,))
     class_weights[no_object_class] = float(cfg.loss.no_object_weight)
     l_cls = F.cross_entropy(pred_logits.flatten(0, 1), cls_targets.flatten(), weight=class_weights)
-    l_box = torch.stack(box_losses).mean() if box_losses else pred_boxes.sum() * 0.0
+    l_center = torch.stack(center_losses).mean() if center_losses else pred_boxes.sum() * 0.0
+    l_size = torch.stack(size_losses).mean() if size_losses else pred_boxes.sum() * 0.0
+    l_yaw = torch.stack(yaw_losses).mean() if yaw_losses else pred_boxes.sum() * 0.0
     if all_matched_embeds:
         matched_embeds = torch.cat(all_matched_embeds, dim=0)
         matched_track_ids = torch.cat(all_matched_track_ids, dim=0)
@@ -323,7 +377,9 @@ def generative_track_loss(
 
     losses = {
         "L_cls": l_cls * float(cfg.loss.lambda_cls),
-        "L_box": l_box * float(cfg.loss.lambda_box),
+        "L_center": l_center * float(cfg.loss.lambda_center),
+        "L_size": l_size * float(cfg.loss.lambda_size),
+        "L_yaw": l_yaw * float(cfg.loss.lambda_yaw),
         "L_embed": l_embed * float(cfg.loss.lambda_embed),
     }
     pred_classes = pred_logits.argmax(dim=-1)
@@ -339,29 +395,41 @@ def generative_track_loss(
     return losses, metrics
 
 
-def greedy_min_cost_match(cost: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def hungarian_min_cost_match(cost: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if cost.numel() == 0:
         device = cost.device
         return torch.empty(0, dtype=torch.long, device=device), torch.empty(0, dtype=torch.long, device=device)
-    num_queries, num_targets = cost.shape
-    order = torch.argsort(cost.flatten())
-    used_q: set[int] = set()
-    used_t: set[int] = set()
-    pred_indices: list[int] = []
-    target_indices: list[int] = []
-    for flat in order.tolist():
-        q = flat // num_targets
-        t = flat % num_targets
-        if q in used_q or t in used_t:
-            continue
-        used_q.add(q)
-        used_t.add(t)
-        pred_indices.append(q)
-        target_indices.append(t)
-        if len(target_indices) >= min(num_queries, num_targets):
-            break
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError as exc:
+        raise RuntimeError("scipy is required for Hungarian matching. Install scipy in the training environment.") from exc
+    pred_indices_np, target_indices_np = linear_sum_assignment(cost.detach().cpu().numpy())
     device = cost.device
-    return torch.as_tensor(pred_indices, dtype=torch.long, device=device), torch.as_tensor(target_indices, dtype=torch.long, device=device)
+    return (
+        torch.as_tensor(pred_indices_np, dtype=torch.long, device=device),
+        torch.as_tensor(target_indices_np, dtype=torch.long, device=device),
+    )
+
+
+def normalize_boxes(boxes: torch.Tensor, cfg: Config) -> torch.Tensor:
+    center_range = torch.as_tensor(cfg.dataset.box_center_range, dtype=boxes.dtype, device=boxes.device)
+    center_min = center_range[:3]
+    center_extent = (center_range[3:6] - center_range[:3]).clamp_min(1e-3)
+    size_scale = torch.as_tensor(cfg.dataset.box_size_scale, dtype=boxes.dtype, device=boxes.device).clamp_min(1e-3)
+    yaw_scale = float(cfg.dataset.box_yaw_scale)
+    xyz = (boxes[..., 0:3] - center_min) / center_extent
+    dims = boxes[..., 3:6] / size_scale
+    yaw = boxes[..., 6:7] / yaw_scale
+    return torch.cat([xyz, dims, yaw], dim=-1)
+
+
+def encode_boxes_for_loss(boxes_normalized: torch.Tensor) -> torch.Tensor:
+    center = boxes_normalized[..., 0:3]
+    log_size = torch.log(boxes_normalized[..., 3:6].clamp_min(1e-4))
+    yaw = boxes_normalized[..., 6:7]
+    yaw_angle = yaw * math.pi
+    yaw_sincos = torch.cat([torch.sin(yaw_angle), torch.cos(yaw_angle)], dim=-1)
+    return torch.cat([center, log_size, yaw_sincos], dim=-1)
 
 
 def track_embedding_consistency_loss(embeds: torch.Tensor, track_ids: torch.Tensor) -> torch.Tensor:
