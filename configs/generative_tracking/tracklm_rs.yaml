@@ -1,5 +1,5 @@
 chapter3_root: /media/ana-4090/LY/chapter3
-detector_cfg_file: /media/ana-4090/LY/chapter3/tools/cfgs/exp46/4-10_A7_mths.yaml
+detector_cfg_file: /path/to/voxelnext_a1.yaml
 detector_ckpt: ""
 
 dataset:
@@ -9,7 +9,7 @@ dataset:
   K: 3
   stride: 1
   max_objects: 64
-  class_names: [Car, Pedestrian, Cyclist, Truck, Bus]
+  class_names: [Car]
   box_center_range: [0.0, -20.0, -4.5, 120.0, 30.0, 10.5]
   box_size_scale: [10.0, 10.0, 5.0]
   box_yaw_scale: 3.141592653589793
@@ -20,7 +20,8 @@ model:
   feature_source: gt_boxes
   detector_mode: cache
   visual_dim: 128
-  detector_token_dim: 128
+  detector_query_feature_dim: 128
+  detector_token_dim: 145
   max_detector_tokens: 256
   online_detector_batch_size: 1
   online_detector_workers: 0
@@ -52,13 +53,13 @@ evaluator:
 
 loss:
   compute_det_loss: false
-  lambda_cls: 1.0
+  lambda_obj: 1.0
   lambda_center: 2.0
   lambda_size: 1.0
   lambda_yaw: 1.0
   lambda_embed: 1.0
   no_object_weight: 0.1
-  matching_cls_cost: 1.0
+  matching_obj_cost: 1.0
   matching_center_cost: 2.0
   matching_size_cost: 1.0
   matching_yaw_cost: 1.0

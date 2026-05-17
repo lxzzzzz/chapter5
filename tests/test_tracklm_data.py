@@ -29,6 +29,13 @@ class TrackLMDataTest(unittest.TestCase):
         self.assertEqual(objects.track_ids.tolist(), [5, 8])
         self.assertEqual(objects.class_ids.tolist(), [0, 0])
 
+    def test_frame_to_objects_filters_non_target_classes(self):
+        info = _info(0, [5, 8])
+        info["annos"]["name"] = np.asarray(["Car", "Pedestrian"])
+        objects = frame_to_objects(info, {"Car": 0})
+        self.assertEqual(objects.track_ids.tolist(), [5])
+        self.assertEqual(objects.class_names.tolist(), ["Car"])
+
     def test_padding_mask_and_targets_for_early_frame(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             info_path = f"{tmpdir}/tracking_infos_train.pkl"

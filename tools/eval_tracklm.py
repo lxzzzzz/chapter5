@@ -83,8 +83,8 @@ def main() -> None:
             batch = move_to_device(batch_cpu, device)
             out = model(batch)
             logits = out["pred_logits"][0].softmax(dim=-1)
-            no_object = logits.shape[-1] - 1
-            pred_scores, pred_classes = logits[:, :no_object].max(dim=-1)
+            pred_scores = logits[:, 1]
+            pred_classes = torch.zeros_like(pred_scores, dtype=torch.long)
             keep = pred_scores.ge(float(cfg.eval.score_thresh))
             result = manager.update(
                 sequence_id=sequence_id,
@@ -125,7 +125,8 @@ def main() -> None:
             "metrics "
             f"precision={metrics['precision']:.4f} "
             f"recall={metrics['recall']:.4f} "
-            f"mota_like={metrics['mota_like']:.4f} "
+            f"ap_3d_iou_0_50={metrics['ap_3d_iou_0_50']:.4f} "
+            f"mota={metrics['mota']:.4f} "
             f"id_switches={metrics['id_switches']:.0f}"
         )
 

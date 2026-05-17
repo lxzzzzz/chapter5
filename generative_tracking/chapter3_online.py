@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .chapter3_features import extract_detector_frame_tokens
+from .chapter3_features import expected_detector_token_dim, extract_detector_frame_tokens
 from .config import Config
 
 
@@ -90,7 +90,7 @@ class OnlineChapter3Detector:
         assert self.dataset is not None and self.model is not None and self.load_data_to_gpu is not None
         rows: list[torch.Tensor] = []
         masks: list[torch.Tensor] = []
-        token_dim = int(self.cfg.model.detector_token_dim)
+        token_dim = int(self.cfg.model.get("detector_token_dim", expected_detector_token_dim(int(self.cfg.model.get("detector_query_feature_dim", 128)))))
         with torch.no_grad():
             for seq_ids, frame_ids in zip(window_sequence_ids, window_frame_ids):
                 sample_tokens: list[np.ndarray] = []

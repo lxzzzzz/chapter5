@@ -37,6 +37,10 @@ class EvaluatorTest(unittest.TestCase):
             metrics = evaluate_tracking_json(result_path, info_path, ["Car"], iou_threshold=0.5)
             self.assertEqual(metrics["matches"], 1.0)
             self.assertEqual(metrics["false_positive"], 0.0)
+            self.assertEqual(metrics["ap_3d_iou_0_50"], 1.0)
+            self.assertEqual(metrics["mota"], 1.0)
+            self.assertEqual(metrics["motp"], 1.0)
+            self.assertEqual(metrics["id_switches"], 0.0)
 
 
 if __name__ == "__main__":

@@ -34,16 +34,17 @@ def frame_to_objects(
     gt_names = np.asarray(annos.get("name", np.asarray(["Unknown"] * len(gt_boxes)))).astype(str)
     gt_track_ids = np.asarray(annos.get("track_id", np.full((len(gt_boxes),), -1)), dtype=np.int64)
 
-    boxes = gt_boxes
+    scores = np.asarray(annos.get("score", np.ones((len(gt_boxes),), dtype=np.float32)), dtype=np.float32)
+    if len(scores) != len(gt_boxes):
+        scores = np.ones((len(gt_boxes),), dtype=np.float32)
+    keep = np.asarray([str(name) in class_to_id for name in gt_names], dtype=bool)
+    boxes = gt_boxes[keep]
     if boxes.ndim == 1:
         boxes = boxes.reshape(-1, 7)
-    names = gt_names
-    track_ids = gt_track_ids
-    scores = np.asarray(annos.get("score", np.ones((len(boxes),), dtype=np.float32)), dtype=np.float32)
-    if len(scores) != len(boxes):
-        scores = np.ones((len(boxes),), dtype=np.float32)
-    scores = np.where(scores >= 0.0, scores, 1.0).astype(np.float32)
-    class_ids = np.asarray([class_to_id.get(str(name), 0) for name in names], dtype=np.int64)
+    names = gt_names[keep]
+    track_ids = gt_track_ids[keep]
+    scores = np.where(scores[keep] >= 0.0, scores[keep], 1.0).astype(np.float32)
+    class_ids = np.asarray([class_to_id[str(name)] for name in names], dtype=np.int64)
     return ObjectFrame(boxes=boxes, class_ids=class_ids, class_names=names, track_ids=track_ids, scores=scores)
 
 

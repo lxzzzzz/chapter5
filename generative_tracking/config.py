@@ -6,12 +6,13 @@ from typing import Any, Mapping
 
 import yaml
 
+from .chapter3_features import expected_detector_token_dim
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
     "device": "auto",
     "chapter3_root": "/media/ana-4090/LY/chapter3",
-    "detector_cfg_file": "/media/ana-4090/LY/chapter3/tools/cfgs/exp46/4-10_A7_mths.yaml",
+    "detector_cfg_file": "/path/to/voxelnext_a1.yaml",
     "detector_ckpt": "",
     "dataset": {
         "name": "xian",
@@ -34,7 +35,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "K": 3,
         "stride": 1,
         "max_objects": 64,
-        "class_names": ["Car", "Pedestrian", "Cyclist", "Truck", "Bus"],
+        "class_names": ["Car"],
         "box_center_range": [0.0, -20.0, -4.5, 120.0, 30.0, 10.5],
         "box_size_scale": [10.0, 10.0, 5.0],
         "box_yaw_scale": 3.141592653589793,
@@ -45,7 +46,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "feature_source": "gt_boxes",
         "detector_mode": "cache",
         "visual_dim": 128,
-        "detector_token_dim": 128,
+        "detector_query_feature_dim": 128,
+        "detector_token_dim": expected_detector_token_dim(128),
         "max_detector_tokens": 256,
         "online_detector_batch_size": 1,
         "online_detector_workers": 0,
@@ -80,13 +82,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "loss": {
         "compute_det_loss": False,
-        "lambda_cls": 1.0,
+        "lambda_obj": 1.0,
         "lambda_center": 2.0,
         "lambda_size": 1.0,
         "lambda_yaw": 1.0,
         "lambda_embed": 1.0,
         "no_object_weight": 0.1,
-        "matching_cls_cost": 1.0,
+        "matching_obj_cost": 1.0,
         "matching_center_cost": 2.0,
         "matching_size_cost": 1.0,
         "matching_yaw_cost": 1.0,
@@ -99,6 +101,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "epochs": 1,
         "max_iters": 0,
         "log_interval": 1,
+        "eval_interval_epochs": 3,
+        "save_interval_epochs": 3,
+        "eval_on_final": True,
+        "eval_max_frames": 0,
+        "best_metric": "mota",
+        "best_mode": "max",
         "save_trainable_only": True,
         "resume": "",
     },
