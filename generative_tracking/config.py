@@ -10,8 +10,8 @@ import yaml
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
     "device": "auto",
-    "chapter3_root": "/home/lx/chapter3",
-    "detector_cfg_file": "/home/lx/chapter3/tools/cfgs/dair_v2x_models/fusion_voxelnext_v2x_xian.yaml",
+    "chapter3_root": "/media/ana-4090/LY/chapter3",
+    "detector_cfg_file": "/media/ana-4090/LY/chapter3/tools/cfgs/dair_v2x_models/fusion_voxelnext_v2x_xian.yaml",
     "detector_ckpt": "",
     "dataset": {
         "name": "xian",
@@ -19,16 +19,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "datasets": ["xian", "v2x_seq", "v2x_real"],
         "info_paths": {
             "xian": {
-                "train": "/home/lx/chapter3/data/v2x_xian/tracking_infos_train.pkl",
-                "val": "/home/lx/chapter3/data/v2x_xian/tracking_infos_val.pkl",
+                "train": "/media/ana-4090/LY/chapter3/data/v2x_xian/tracking_infos_train.pkl",
+                "val": "/media/ana-4090/LY/chapter3/data/v2x_xian/tracking_infos_val.pkl",
             },
             "v2x_real": {
-                "train": "/home/lx/chapter3/data/v2x_real/tracking_infos_train.pkl",
-                "val": "/home/lx/chapter3/data/v2x_real/tracking_infos_val.pkl",
+                "train": "/media/ana-4090/LY/chapter3/data/v2x_real/tracking_infos_train.pkl",
+                "val": "/media/ana-4090/LY/chapter3/data/v2x_real/tracking_infos_val.pkl",
             },
             "v2x_seq": {
-                "train": "/home/lx/chapter3/data/v2x_xian/tracking_infos_train.pkl",
-                "val": "/home/lx/chapter3/data/v2x_xian/tracking_infos_val.pkl",
+                "train": "/media/ana-4090/LY/chapter3/data/v2x_xian/tracking_infos_train.pkl",
+                "val": "/media/ana-4090/LY/chapter3/data/v2x_xian/tracking_infos_val.pkl",
             },
         },
         "K": 3,
