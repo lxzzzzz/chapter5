@@ -33,7 +33,7 @@ def move_to_device(batch: dict, device: torch.device) -> dict:
 def load_model_checkpoint(path: Path, model: torch.nn.Module, device: torch.device) -> int:
     checkpoint = torch.load(path, map_location=device)
     state_dict = checkpoint.get("model_state", checkpoint)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=not bool(checkpoint.get("trainable_only", False)))
     return int(checkpoint.get("iter", 0)) if isinstance(checkpoint, dict) else 0
 
 
@@ -45,7 +45,7 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=tracklm_collate)
     model = TrackLMRS(cfg).to(device)
     ckpt_arg = args.ckpt if args.ckpt is not None else str(cfg.eval.get("checkpoint", ""))
-    ckpt_path = Path(ckpt_arg) if ckpt_arg else Path(cfg.output_dir) / "checkpoints" / "latest.pth"
+    ckpt_path = Path(ckpt_arg) if ckpt_arg else Path(cfg.output_dir) / "checkpoints" / "best.pth"
     if ckpt_path.exists():
         ckpt_iter = load_model_checkpoint(ckpt_path, model, device)
         print(f"loaded checkpoint={ckpt_path} iter={ckpt_iter}")
@@ -60,7 +60,7 @@ def main() -> None:
     )
     outputs = []
     current_sequence = None
-    with torch.no_grad():
+    with torch.inference_mode():
         for frame_count, batch_cpu in enumerate(loader, start=1):
             if args.max_frames is not None and frame_count > args.max_frames:
                 break

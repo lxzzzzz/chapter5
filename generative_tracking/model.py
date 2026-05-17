@@ -147,6 +147,7 @@ class RealFrozenTextLM(nn.Module):
         if attn_impl:
             kwargs["attn_implementation"] = attn_impl
         self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+        self.backbone = self.model.base_model
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=kwargs["trust_remote_code"])
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -169,8 +170,8 @@ class RealFrozenTextLM(nn.Module):
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         embed_weight = self.model.get_input_embeddings().weight
         inputs_embeds = inputs_embeds.to(dtype=embed_weight.dtype)
-        output = self.model(inputs_embeds=inputs_embeds, use_cache=False, output_hidden_states=True)
-        return output.hidden_states[-1]
+        output = self.backbone(inputs_embeds=inputs_embeds, use_cache=False, return_dict=True)
+        return output.last_hidden_state
 
 
 class GenerativeTrackHead(nn.Module):

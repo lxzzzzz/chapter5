@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 import random
 from pathlib import Path
 from typing import Any
@@ -25,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_iters", type=int, default=None, help="Optional global step limit for quick debug runs.")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--save_interval", type=int, default=None)
+    parser.add_argument("--save_full_state", action="store_true")
     parser.add_argument("--resume", default=None)
     return parser.parse_args()
 
@@ -46,21 +45,31 @@ def save_checkpoint(
     path: Path,
     *,
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
     cfg: dict,
     epoch: int,
     step_in_epoch: int,
     global_step: int,
+    best_total: float,
+    trainable_only: bool,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if trainable_only:
+        state_dict = {
+            name: param.detach().cpu()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+    else:
+        state_dict = {name: value.detach().cpu() for name, value in model.state_dict().items()}
     torch.save(
         {
             "iter": global_step,
             "global_step": global_step,
             "epoch": epoch,
             "step_in_epoch": step_in_epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
+            "best_total": best_total,
+            "trainable_only": trainable_only,
+            "model_state": state_dict,
             "cfg": to_plain(cfg),
         },
         path,
@@ -75,7 +84,7 @@ def load_checkpoint(
     device: torch.device,
 ) -> tuple[int, int]:
     checkpoint = torch.load(path, map_location=device)
-    model.load_state_dict(checkpoint["model_state"])
+    model.load_state_dict(checkpoint["model_state"], strict=not bool(checkpoint.get("trainable_only", False)))
     if "optimizer_state" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state"])
     global_step = int(checkpoint.get("global_step", checkpoint.get("iter", 0)))
@@ -94,8 +103,8 @@ def main() -> None:
         cfg.train.batch_size = args.batch_size
     if args.lr is not None:
         cfg.train.lr = args.lr
-    if args.save_interval is not None:
-        cfg.train.save_interval = args.save_interval
+    if args.save_full_state:
+        cfg.train.save_trainable_only = False
     if args.resume is not None:
         cfg.train.resume = args.resume
 
@@ -162,6 +171,8 @@ def main() -> None:
     global_step = start_global_step
     stop_training = False
     completed_epochs = start_global_step // steps_per_epoch
+    best_total = float("inf")
+    best_path = checkpoint_dir / "best.pth"
     for epoch in range(completed_epochs + 1, epochs + 1):
         for step_in_epoch, batch in enumerate(loader, start=1):
             absolute_step = (epoch - 1) * steps_per_epoch + step_in_epoch
@@ -176,18 +187,31 @@ def main() -> None:
             out = model(batch)
             out["loss"].backward()
             optimizer.step()
+            metrics = {
+                "L_det": float(out["L_det"].detach().cpu()),
+                "L_cls": float(out["L_cls"].detach().cpu()),
+                "L_center": float(out["L_center"].detach().cpu()),
+                "L_size": float(out["L_size"].detach().cpu()),
+                "L_yaw": float(out["L_yaw"].detach().cpu()),
+                "L_embed": float(out["L_embed"].detach().cpu()),
+                "total": float(out["loss"].detach().cpu()),
+                "match_count": float(out["match_count"].detach().cpu()),
+                "track_cls_acc": float(out["track_cls_acc"].detach().cpu()),
+            }
+            if metrics["match_count"] > 0 and metrics["total"] < best_total:
+                best_total = metrics["total"]
+                save_checkpoint(
+                    best_path,
+                    model=model,
+                    cfg=cfg,
+                    epoch=epoch,
+                    step_in_epoch=step_in_epoch,
+                    global_step=global_step,
+                    best_total=best_total,
+                    trainable_only=bool(cfg.train.get("save_trainable_only", True)),
+                )
+                print(f"saved best checkpoint iter={global_step} total={best_total:.4f} path={best_path}", flush=True)
             if global_step % int(cfg.train.log_interval) == 0:
-                metrics = {
-                    "L_det": float(out["L_det"].detach().cpu()),
-                    "L_cls": float(out["L_cls"].detach().cpu()),
-                    "L_center": float(out["L_center"].detach().cpu()),
-                    "L_size": float(out["L_size"].detach().cpu()),
-                    "L_yaw": float(out["L_yaw"].detach().cpu()),
-                    "L_embed": float(out["L_embed"].detach().cpu()),
-                    "total": float(out["loss"].detach().cpu()),
-                    "match_count": float(out["match_count"].detach().cpu()),
-                    "track_cls_acc": float(out["track_cls_acc"].detach().cpu()),
-                }
                 with log_path.open("a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow(
@@ -219,63 +243,10 @@ def main() -> None:
                     f"track_cls_acc={metrics['track_cls_acc']:.4f}",
                     flush=True,
                 )
-            if int(cfg.train.save_interval) > 0 and global_step % int(cfg.train.save_interval) == 0:
-                save_checkpoint(
-                    checkpoint_dir / f"checkpoint_iter_{global_step}.pth",
-                    model=model,
-                    optimizer=optimizer,
-                    cfg=cfg,
-                    epoch=epoch,
-                    step_in_epoch=step_in_epoch,
-                    global_step=global_step,
-                )
-                save_checkpoint(
-                    checkpoint_dir / "latest.pth",
-                    model=model,
-                    optimizer=optimizer,
-                    cfg=cfg,
-                    epoch=epoch,
-                    step_in_epoch=step_in_epoch,
-                    global_step=global_step,
-                )
-                print(f"saved checkpoint iter={global_step} dir={checkpoint_dir}", flush=True)
         if stop_training:
             break
 
-    final_epoch = min(epochs, max(1, (global_step + steps_per_epoch - 1) // steps_per_epoch))
-    final_step_in_epoch = steps_per_epoch if global_step % steps_per_epoch == 0 else global_step % steps_per_epoch
-    if global_step > 0:
-        final_epoch = int(math.ceil(global_step / steps_per_epoch))
-    else:
-        final_step_in_epoch = 0
-    save_checkpoint(
-        checkpoint_dir / f"checkpoint_iter_{global_step}.pth",
-        model=model,
-        optimizer=optimizer,
-        cfg=cfg,
-        epoch=final_epoch,
-        step_in_epoch=final_step_in_epoch,
-        global_step=global_step,
-    )
-    save_checkpoint(
-        checkpoint_dir / "latest.pth",
-        model=model,
-        optimizer=optimizer,
-        cfg=cfg,
-        epoch=final_epoch,
-        step_in_epoch=final_step_in_epoch,
-        global_step=global_step,
-    )
-    save_checkpoint(
-        checkpoint_dir / "final.pth",
-        model=model,
-        optimizer=optimizer,
-        cfg=cfg,
-        epoch=final_epoch,
-        step_in_epoch=final_step_in_epoch,
-        global_step=global_step,
-    )
-    print(f"saved final checkpoint epoch={final_epoch} iter={global_step} dir={checkpoint_dir}", flush=True)
+    print(f"finished training iter={global_step} best_total={best_total:.4f} checkpoint={best_path}", flush=True)
 
 
 if __name__ == "__main__":
