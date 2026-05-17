@@ -190,8 +190,9 @@ class GenerativeTrackHead(nn.Module):
         self.score_head = nn.Linear(context_dim, 1)
 
     def forward(self, lm_context: torch.Tensor) -> dict[str, torch.Tensor]:
+        lm_context = lm_context.to(dtype=self.track_queries.dtype)
         bsz = lm_context.shape[0]
-        query = self.track_queries.unsqueeze(0).expand(bsz, -1, -1).to(dtype=lm_context.dtype)
+        query = self.track_queries.unsqueeze(0).expand(bsz, -1, -1)
         attended, _ = self.attn(query, lm_context, lm_context, need_weights=False)
         x = self.norm(query + attended)
         x = self.norm(x + self.ffn(x))

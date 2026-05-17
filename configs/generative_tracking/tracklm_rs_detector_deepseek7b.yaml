@@ -1,5 +1,5 @@
 chapter3_root: /media/ana-4090/LY/chapter3
-detector_cfg_file: /media/ana-4090/LY/chapter3/tools/cfgs/dair_v2x_models/fusion_voxelnext_v2x_xian.yaml
+detector_cfg_file: /media/ana-4090/LY/chapter3/tools/cfgs/exp46/4-10_A7_mths.yaml
 detector_ckpt: /media/ana-4090/LY/chapter3/output/cfgs/exp46/4-10_A7_mths/exp46/4-10/A7/ckpt/checkpoint_epoch_2.pth
 
 dataset:
