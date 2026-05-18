@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 from generative_tracking.config import load_config
+from generative_tracking.ab3dmot_evaluator import evaluate_ab3dmot_json
 from generative_tracking.evaluator import evaluate_tracking_json
 from generative_tracking.nova_model import NOVAAssociationModel
 from generative_tracking.nova_runtime import run_nova_tracking
@@ -23,6 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress_interval", type=int, default=50)
     parser.add_argument("--output", default=None)
     parser.add_argument("--eval_metrics", action="store_true")
+    parser.add_argument("--eval_ab3dmot", action="store_true")
+    parser.add_argument("--ab3dmot_output", default=None)
+    parser.add_argument("--ab3dmot_recall_points", type=int, default=40)
     parser.add_argument("--eval_score_thresh", type=float, default=None, help="Override eval.score_thresh for cached detection filtering.")
     parser.add_argument("--association_threshold", type=float, default=None, help="Override nova.association_threshold for accepting Hungarian matches.")
     return parser.parse_args()
@@ -86,6 +90,27 @@ def main() -> None:
             f"ap_3d_iou_0_50={metrics['ap_3d_iou_0_50']:.4f} "
             f"mota={metrics['mota']:.4f} "
             f"id_switches={metrics['id_switches']:.0f}",
+            flush=True,
+        )
+    if args.eval_ab3dmot:
+        output_ab3d = args.ab3dmot_output or str(Path(cfg.output_dir) / "tracking_metrics_ab3dmot.json")
+        ab3d = evaluate_ab3dmot_json(
+            output_path,
+            info_path,
+            class_names=list(cfg.dataset.class_names),
+            iou_threshold=float(cfg.evaluator.iou_threshold),
+            recall_points=int(args.ab3dmot_recall_points),
+            output_path=output_ab3d,
+        )
+        print(
+            "ab3dmot "
+            f"sAMOTA={float(ab3d['sAMOTA']):.4f} "
+            f"AMOTA={float(ab3d['AMOTA']):.4f} "
+            f"AMOTP={float(ab3d['AMOTP']):.4f} "
+            f"MOTA={float(ab3d['MOTA']):.4f} "
+            f"MOTP={float(ab3d['MOTP']):.4f} "
+            f"IDS={float(ab3d['IDS']):.0f} "
+            f"FRAG={float(ab3d['FRAG']):.0f}",
             flush=True,
         )
 
