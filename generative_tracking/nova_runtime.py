@@ -10,6 +10,11 @@ import torch
 from .config import Config, resolve_info_path
 from .nova_data import DetectionFrame, NOVAFormulator, load_detection_cache
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 
 @dataclass
 class NOVATrackState:
@@ -223,6 +228,8 @@ def run_nova_tracking(
     split: str = "val",
     max_frames: int = 0,
     progress_interval: int = 50,
+    use_tqdm: bool = False,
+    desc: str = "nova eval",
 ) -> tuple[list[dict[str, Any]], Path]:
     detections = load_detection_cache(cfg, split)
     info_path = Path(resolve_info_path(cfg, split))
@@ -238,7 +245,9 @@ def run_nova_tracking(
     outputs: list[dict[str, Any]] = []
     current_sequence = None
     model.eval()
-    for frame_count, info in enumerate(ordered_infos, start=1):
+    iterator = enumerate(ordered_infos, start=1)
+    progress_bar = tqdm(total=len(ordered_infos), desc=desc, dynamic_ncols=True, leave=True) if use_tqdm and tqdm is not None else None
+    for frame_count, info in iterator:
         sequence_id = str(info.get("sequence_id", ""))
         frame_id = str(info.get("frame_id", info.get("frame_idx", "")))
         if sequence_id != current_sequence:
@@ -255,6 +264,11 @@ def run_nova_tracking(
                 pred_labels=np.zeros((0,), dtype=np.int64),
             )
         outputs.append(tracker.update(det, model))
-        if progress_interval > 0 and (frame_count == 1 or frame_count % progress_interval == 0 or frame_count == len(ordered_infos)):
+        if progress_bar is not None:
+            progress_bar.update(1)
+            progress_bar.set_postfix(frame=f"{frame_count}/{len(ordered_infos)}")
+        elif progress_interval > 0 and (frame_count == 1 or frame_count % progress_interval == 0 or frame_count == len(ordered_infos)):
             print(f"nova eval progress frames={frame_count}/{len(ordered_infos)}", flush=True)
+    if progress_bar is not None:
+        progress_bar.close()
     return outputs, info_path

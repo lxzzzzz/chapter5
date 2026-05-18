@@ -101,6 +101,33 @@ def append_log(path: Path, row: dict[str, float | int]) -> None:
         writer.writerow({key: row.get(key, 0) for key in fields})
 
 
+def append_validation_log(path: Path, epoch: int, global_step: int, metrics: dict[str, float]) -> None:
+    fields = [
+        "epoch",
+        "global_step",
+        "ap_3d_iou_0_50",
+        "mota",
+        "motp",
+        "precision",
+        "recall",
+        "f1",
+        "id_switches",
+        "fragments",
+        "false_positive",
+        "false_negative",
+        "num_gt",
+        "num_pred",
+    ]
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if write_header:
+            writer.writeheader()
+        row = {"epoch": epoch, "global_step": global_step}
+        row.update({field: float(metrics.get(field, 0.0)) for field in fields[2:]})
+        writer.writerow(row)
+
+
 def run_validation(
     *,
     cfg: Any,
@@ -110,6 +137,7 @@ def run_validation(
     global_step: int,
     output_dir: Path,
     progress_interval: int,
+    use_tqdm: bool,
 ) -> dict[str, float]:
     validation_dir = output_dir / "validation"
     validation_dir.mkdir(parents=True, exist_ok=True)
@@ -120,6 +148,8 @@ def run_validation(
         split="val",
         max_frames=int(cfg.train.get("eval_max_frames", 0)),
         progress_interval=progress_interval,
+        use_tqdm=use_tqdm,
+        desc=f"nova val epoch {epoch}",
     )
     result_path = validation_dir / f"epoch_{epoch:03d}_tracking_results.json"
     metrics_path = validation_dir / f"epoch_{epoch:03d}_metrics.json"
@@ -136,6 +166,7 @@ def run_validation(
     metrics["global_step"] = float(global_step)
     with (validation_dir / "latest_metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+    append_validation_log(validation_dir / "validation_metrics.csv", epoch, global_step, metrics)
     return metrics
 
 
@@ -184,6 +215,8 @@ def main() -> None:
     output_dir = Path(cfg.output_dir)
     checkpoint_dir = output_dir / "checkpoints"
     output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "run_config.json").open("w", encoding="utf-8") as f:
+        json.dump(to_plain(cfg), f, indent=2)
     log_path = output_dir / "training_log.csv"
     progress_interval = max(1, int(args.progress_interval))
     epochs = int(cfg.train.get("epochs", 1))
@@ -207,13 +240,22 @@ def main() -> None:
         flush=True,
     )
     use_tqdm = tqdm is not None
-    progress = tqdm(total=total_steps, desc="nova train", dynamic_ncols=True) if use_tqdm else None
-    if progress is not None and global_step:
-        progress.update(min(global_step, total_steps))
     model.train()
     stop = False
     for epoch in range(start_epoch + 1, epochs + 1):
-        for batch in loader:
+        epoch_start_step = (epoch - 1) * steps_per_epoch
+        epoch_target_steps = min(steps_per_epoch, max(0, total_steps - epoch_start_step))
+        epoch_progress = (
+            tqdm(
+                total=epoch_target_steps,
+                desc=f"nova train epoch {epoch}/{epochs}",
+                dynamic_ncols=True,
+                leave=True,
+            )
+            if use_tqdm and epoch_target_steps > 0
+            else None
+        )
+        for step_in_epoch, batch in enumerate(loader, start=1):
             if global_step >= total_steps:
                 stop = True
                 break
@@ -235,19 +277,28 @@ def main() -> None:
             }
             if global_step % int(cfg.train.log_interval) == 0:
                 append_log(log_path, row)
-            if progress is not None:
-                progress.update(1)
-                progress.set_postfix(total=f"{row['total']:.4f}", acc=f"{row['match_acc']:.3f}")
+            if epoch_progress is not None:
+                epoch_progress.update(1)
+                epoch_progress.set_postfix(
+                    step=f"{step_in_epoch}/{steps_per_epoch}",
+                    global_step=f"{global_step}/{total_steps}",
+                    total=f"{row['total']:.4f}",
+                    acc=f"{row['match_acc']:.3f}",
+                )
             elif global_step == 1 or global_step % progress_interval == 0 or global_step == total_steps:
                 print(
                     f"nova train iter={global_step}/{total_steps} epoch={epoch}/{epochs} "
                     f"loss={row['total']:.4f} acc={row['match_acc']:.4f}",
                     flush=True,
                 )
+        if epoch_progress is not None:
+            epoch_progress.close()
         epoch_completed = not stop
-        if epoch_completed and epoch % save_interval_epochs == 0:
+        should_checkpoint = epoch_completed and (epoch % save_interval_epochs == 0 or epoch == epochs)
+        if should_checkpoint:
+            epoch_path = checkpoint_dir / f"epoch_{epoch:03d}.pth"
             save_checkpoint(
-                checkpoint_dir / f"epoch_{epoch:03d}.pth",
+                epoch_path,
                 model=model,
                 optimizer=optimizer,
                 cfg=cfg,
@@ -257,6 +308,23 @@ def main() -> None:
                 best_metric_value=best_metric_value,
                 trainable_only=bool(cfg.train.get("save_trainable_only", True)),
             )
+            latest_path = checkpoint_dir / "latest.pth"
+            save_checkpoint(
+                latest_path,
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                epoch=epoch,
+                global_step=global_step,
+                best_metric_name=best_metric_name,
+                best_metric_value=best_metric_value,
+                trainable_only=bool(cfg.train.get("save_trainable_only", True)),
+            )
+            ckpt_msg = f"saved checkpoint epoch={epoch} global_step={global_step} path={epoch_path} latest={latest_path}"
+            if use_tqdm and tqdm is not None:
+                tqdm.write(ckpt_msg)
+            else:
+                print(ckpt_msg, flush=True)
         should_validate = epoch_completed and (
             epoch % eval_interval_epochs == 0 or (bool(cfg.train.get("eval_on_final", True)) and epoch == epochs)
         )
@@ -271,6 +339,7 @@ def main() -> None:
                 global_step=global_step,
                 output_dir=output_dir,
                 progress_interval=progress_interval,
+                use_tqdm=use_tqdm,
             )
             if was_training:
                 model.train()
@@ -291,16 +360,35 @@ def main() -> None:
                 )
                 with (output_dir / "validation" / "best_metrics.json").open("w", encoding="utf-8") as f:
                     json.dump(metrics, f, indent=2)
-                print(f"saved best checkpoint {best_path} {best_metric_name}={best_metric_value:.4f}", flush=True)
-            print(
+                msg = f"saved best checkpoint {best_path} {best_metric_name}={best_metric_value:.4f}"
+                if use_tqdm and tqdm is not None:
+                    tqdm.write(msg)
+                else:
+                    print(msg, flush=True)
+            val_msg = (
                 f"nova validation epoch={epoch} ap_3d_iou_0_50={float(metrics.get('ap_3d_iou_0_50', 0.0)):.4f} "
-                f"mota={float(metrics.get('mota', 0.0)):.4f} id_switches={float(metrics.get('id_switches', 0.0)):.0f}",
-                flush=True,
+                f"mota={float(metrics.get('mota', 0.0)):.4f} id_switches={float(metrics.get('id_switches', 0.0)):.0f}"
             )
+            if use_tqdm and tqdm is not None:
+                tqdm.write(val_msg)
+            else:
+                print(val_msg, flush=True)
         if stop:
             break
-    if progress is not None:
-        progress.close()
+    if global_step > 0:
+        latest_path = checkpoint_dir / "latest.pth"
+        save_checkpoint(
+            latest_path,
+            model=model,
+            optimizer=optimizer,
+            cfg=cfg,
+            epoch=min(epoch, epochs) if "epoch" in locals() else start_epoch,
+            global_step=global_step,
+            best_metric_name=best_metric_name,
+            best_metric_value=best_metric_value,
+            trainable_only=bool(cfg.train.get("save_trainable_only", True)),
+        )
+        print(f"saved latest checkpoint path={latest_path}", flush=True)
     print(f"finished nova training iter={global_step} best_{best_metric_name}={best_metric_value}", flush=True)
 
 
