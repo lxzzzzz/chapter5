@@ -83,6 +83,10 @@ class NOVAAssociationModel(nn.Module):
             self.box_token_id = None
             self.yes_token_id = None
             self.no_token_id = None
+            self.birth_token_id = None
+            self.suppress_token_id = None
+            self.keep_token_id = None
+            self.end_token_id = None
         else:
             self.llm = RealFrozenTextLM(cfg, llm_hidden, bool(cfg.model.freeze_llm))
             self._configure_real_llm_tokens()
@@ -127,11 +131,15 @@ class NOVAAssociationModel(nn.Module):
             candidate_time,
         )
         hist_tokens = hist_tokens * history_mask.unsqueeze(-1).to(dtype=hist_tokens.dtype)
-        box_mask = torch.cat(
-            [history_mask, torch.ones((bsz, 1), dtype=torch.bool, device=device)],
-            dim=1,
-        )
+        candidate_mask = batch.get("candidate_mask")
+        if isinstance(candidate_mask, torch.Tensor):
+            candidate_mask = candidate_mask.to(device=device, dtype=torch.bool).reshape(bsz, 1)
+        else:
+            candidate_mask = torch.ones((bsz, 1), dtype=torch.bool, device=device)
+        box_mask = torch.cat([history_mask, candidate_mask], dim=1)
         box_embeds = self.adapter(torch.cat([hist_tokens, cand_tokens], dim=1))
+        if "candidate_mask" in batch:
+            box_embeds = box_embeds * box_mask.unsqueeze(-1).to(dtype=box_embeds.dtype)
         if bool(self.cfg.model.use_mock_llm):
             match_logits, pair_context = self._mock_decision(box_embeds)
         else:
@@ -139,10 +147,17 @@ class NOVAAssociationModel(nn.Module):
         quality = self.quality_head(pair_context).squeeze(-1).sigmoid()
         out: dict[str, Any] = {
             "match_logits": match_logits,
+            "action_logits": match_logits,
             "quality": quality,
             "match_prob": match_logits.softmax(dim=-1)[:, 1],
+            "action_prob": match_logits.softmax(dim=-1)[:, 1],
         }
-        if "match_label" in batch:
+        if "action_label" in batch:
+            losses, metrics = nova_multitask_loss(out, batch, self.cfg)
+            out.update(losses)
+            out.update(metrics)
+            out["loss"] = out["L_action"] + out["L_quality"]
+        elif "match_label" in batch:
             losses, metrics = nova_association_loss(out, batch, self.cfg)
             out.update(losses)
             out.update(metrics)
@@ -191,7 +206,8 @@ class NOVAAssociationModel(nn.Module):
         answer_pos = attention_mask.long().sum(dim=1).clamp_min(1) - 1
         row_idx = torch.arange(input_ids.shape[0], device=device)
         logits = output.logits[row_idx, answer_pos]
-        match_logits = torch.stack([logits[:, int(self.no_token_id)], logits[:, int(self.yes_token_id)]], dim=-1)
+        negative_ids, positive_ids = self._action_token_ids_for_batch(batch, device)
+        match_logits = torch.stack([logits.gather(1, negative_ids[:, None]).squeeze(1), logits.gather(1, positive_ids[:, None]).squeeze(1)], dim=-1)
         hidden = output.hidden_states[-1][row_idx, answer_pos]
         return match_logits.to(dtype=self.norm.weight.dtype), self.norm(hidden.to(dtype=self.norm.weight.dtype))
 
@@ -253,6 +269,29 @@ class NOVAAssociationModel(nn.Module):
         self.box_token_id = int(tokenizer.convert_tokens_to_ids(box_token))
         self.yes_token_id = self._resolve_answer_token_id(str(self.cfg.nova.get("yes_token", "Yes")))
         self.no_token_id = self._resolve_answer_token_id(str(self.cfg.nova.get("no_token", "No")))
+        self.birth_token_id = self._resolve_answer_token_id(str(self.cfg.nova.get("birth_token", "Birth")))
+        self.suppress_token_id = self._resolve_answer_token_id(str(self.cfg.nova.get("suppress_token", "Suppress")))
+        self.keep_token_id = self._resolve_answer_token_id(str(self.cfg.nova.get("keep_token", "Keep")))
+        self.end_token_id = self._resolve_answer_token_id(str(self.cfg.nova.get("end_token", "End")))
+
+    def _action_token_ids_for_batch(self, batch: dict[str, torch.Tensor], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        task_names = batch.get("task_name")
+        if not task_names:
+            task_names = ["association"] * int(batch["candidate_box"].shape[0])
+        negative: list[int] = []
+        positive: list[int] = []
+        for task_name in task_names:
+            task = str(task_name)
+            if task == "birth":
+                negative.append(int(self.suppress_token_id))
+                positive.append(int(self.birth_token_id))
+            elif task == "lifecycle":
+                negative.append(int(self.end_token_id))
+                positive.append(int(self.keep_token_id))
+            else:
+                negative.append(int(self.no_token_id))
+                positive.append(int(self.yes_token_id))
+        return torch.as_tensor(negative, dtype=torch.long, device=device), torch.as_tensor(positive, dtype=torch.long, device=device)
 
     def _resolve_answer_token_id(self, token_text: str) -> int:
         tokenizer = self.llm.tokenizer
@@ -307,3 +346,39 @@ def nova_association_loss(
         "positive_count": positives.float().sum().detach(),
     }
     return losses, metrics
+
+
+def nova_multitask_loss(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    cfg: Config,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    logits = outputs["action_logits"]
+    labels = batch["action_label"].to(logits.device).long()
+    target_iou = batch["target_iou"].to(outputs["quality"].device).float()
+    quality_valid = batch.get("quality_valid", torch.zeros_like(labels, dtype=torch.bool)).to(outputs["quality"].device).bool()
+    l_action = F.cross_entropy(logits, labels)
+    if quality_valid.any():
+        l_quality = F.smooth_l1_loss(outputs["quality"][quality_valid], target_iou[quality_valid], reduction="mean")
+    else:
+        l_quality = outputs["quality"].sum() * 0.0
+    pred = logits.argmax(dim=-1)
+    acc = pred.eq(labels).float().mean() if labels.numel() else logits.new_zeros(())
+    positives = labels.eq(1)
+    positive_recall = pred[positives].eq(1).float().mean() if positives.any() else logits.new_zeros(())
+    losses = {
+        "L_action": l_action,
+        "L_match": l_action,
+        "L_quality": l_quality * float(cfg.loss.get("lambda_quality", 1.0)),
+    }
+    metrics = {
+        "action_acc": acc.detach(),
+        "match_acc": acc.detach(),
+        "positive_recall": positive_recall.detach(),
+        "positive_count": positives.float().sum().detach(),
+    }
+    return losses, metrics
+
+
+class NOVALifecycleModel(NOVAAssociationModel):
+    """Task-aware NOVA V2 model for association, birth, and lifecycle decisions."""

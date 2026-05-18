@@ -155,6 +155,134 @@ class NOVAOnlineTracker:
         return track_id
 
 
+class NOVALifecycleOnlineTracker(NOVAOnlineTracker):
+    """NOVA V2 online tracker with LLM Birth/Suppress and Keep/End decisions."""
+
+    def update(self, det: DetectionFrame, model: torch.nn.Module) -> dict[str, Any]:
+        active_ids = sorted(self.tracks)
+        score_matrix = self._score_pairs(det, active_ids, model)
+        matches, unmatched_tracks, unmatched_dets = associate_by_scores(score_matrix, threshold=self.association_threshold)
+        outputs: list[dict[str, Any]] = []
+        assigned_track_ids: set[int] = set()
+        for track_pos, det_idx, match_score in matches:
+            track_id = active_ids[track_pos]
+            self._append_detection(track_id, det, det_idx)
+            assigned_track_ids.add(track_id)
+            outputs.append(self._output_track(track_id, det, det_idx, match_score))
+
+        birth_decisions = self._birth_decisions(det, unmatched_dets, score_matrix, model)
+        for det_idx, should_birth in birth_decisions.items():
+            if not should_birth:
+                continue
+            track_id = self._new_track_id()
+            self._append_detection(track_id, det, det_idx)
+            assigned_track_ids.add(track_id)
+            outputs.append(self._output_track(track_id, det, det_idx, 1.0))
+
+        unmatched_track_ids = {active_ids[idx] for idx in unmatched_tracks if idx < len(active_ids)}
+        lifecycle_decisions = self._lifecycle_decisions(unmatched_track_ids - assigned_track_ids, score_matrix, active_ids, model)
+        for track_id in sorted(unmatched_track_ids - assigned_track_ids):
+            if track_id not in self.tracks:
+                continue
+            if lifecycle_decisions.get(track_id, False):
+                self.tracks[track_id].lost_frames += 1
+                if self.tracks[track_id].lost_frames > self.max_lost_frames:
+                    del self.tracks[track_id]
+            else:
+                del self.tracks[track_id]
+
+        outputs.sort(key=lambda item: int(item["id"]))
+        return {"sequence_id": det.sequence_id, "frame_id": det.frame_id, "tracks": outputs}
+
+    def _birth_decisions(
+        self,
+        det: DetectionFrame,
+        unmatched_dets: list[int],
+        score_matrix: np.ndarray,
+        model: torch.nn.Module,
+    ) -> dict[int, bool]:
+        if not unmatched_dets:
+            return {}
+        rows: list[dict[str, Any]] = []
+        empty = self._empty_history_tensors()
+        best_scores = score_matrix.max(axis=0) if score_matrix.size else np.zeros((len(det.pred_boxes),), dtype=np.float32)
+        for det_idx in unmatched_dets:
+            prompt_text = self.formulator.build_birth_prompt(
+                candidate_class_id=int(det.pred_labels[det_idx]),
+                detector_score=float(det.pred_scores[det_idx]),
+                best_assoc_score=float(best_scores[det_idx]) if det_idx < len(best_scores) else 0.0,
+            )
+            row = dict(empty)
+            row.update(
+                {
+                    "candidate_box": det.pred_boxes[det_idx],
+                    "candidate_score": np.float32(det.pred_scores[det_idx]),
+                    "candidate_class_id": np.int64(det.pred_labels[det_idx]),
+                    "prompt_text": prompt_text,
+                    "box_token_mask": np.concatenate([empty["track_history_mask"], np.asarray([True], dtype=np.bool_)]),
+                    "candidate_mask": np.bool_(True),
+                    "task_name": "birth",
+                }
+            )
+            rows.append(row)
+        batch = _runtime_collate(rows, self.device)
+        with torch.inference_mode():
+            out = model(batch)
+        logits = out.get("action_logits", out.get("match_logits"))
+        decisions = logits.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
+        return {int(det_idx): bool(decisions[pos] == 1) for pos, det_idx in enumerate(unmatched_dets)}
+
+    def _lifecycle_decisions(
+        self,
+        track_ids: set[int],
+        score_matrix: np.ndarray,
+        active_ids: list[int],
+        model: torch.nn.Module,
+    ) -> dict[int, bool]:
+        if not track_ids:
+            return {}
+        rows: list[dict[str, Any]] = []
+        ordered_track_ids = sorted(track_ids)
+        for track_id in ordered_track_ids:
+            hist = self._history_tensors(track_id)
+            track_pos = active_ids.index(track_id) if track_id in active_ids else -1
+            best_score = float(score_matrix[track_pos].max()) if track_pos >= 0 and score_matrix.shape[1] > 0 else 0.0
+            prompt_text = self.formulator.build_lifecycle_prompt(
+                track_id=int(track_id),
+                lost_frames=int(self.tracks[track_id].lost_frames + 1),
+                best_assoc_score=best_score,
+                history_mask=hist["track_history_mask"],
+                history_class_ids=hist["track_history_class_ids"],
+            )
+            row = dict(hist)
+            row.update(
+                {
+                    "candidate_box": np.zeros((7,), dtype=np.float32),
+                    "candidate_score": np.float32(0.0),
+                    "candidate_class_id": np.int64(0),
+                    "prompt_text": prompt_text,
+                    "box_token_mask": np.concatenate([hist["track_history_mask"], np.asarray([False], dtype=np.bool_)]),
+                    "candidate_mask": np.bool_(False),
+                    "task_name": "lifecycle",
+                }
+            )
+            rows.append(row)
+        batch = _runtime_collate(rows, self.device)
+        with torch.inference_mode():
+            out = model(batch)
+        logits = out.get("action_logits", out.get("match_logits"))
+        decisions = logits.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
+        return {int(track_id): bool(decisions[pos] == 1) for pos, track_id in enumerate(ordered_track_ids)}
+
+    def _empty_history_tensors(self) -> dict[str, np.ndarray]:
+        return {
+            "track_history_boxes": np.zeros((self.history_len, 7), dtype=np.float32),
+            "track_history_scores": np.zeros((self.history_len,), dtype=np.float32),
+            "track_history_class_ids": np.zeros((self.history_len,), dtype=np.int64),
+            "track_history_mask": np.zeros((self.history_len,), dtype=np.bool_),
+        }
+
+
 def associate_by_scores(score_matrix: np.ndarray, threshold: float) -> tuple[list[tuple[int, int, float]], list[int], list[int]]:
     scores = np.asarray(score_matrix, dtype=np.float32)
     num_tracks, num_dets = scores.shape if scores.ndim == 2 else (0, 0)
@@ -195,7 +323,7 @@ def _greedy_score_match(scores: np.ndarray) -> list[tuple[int, int, float]]:
 
 
 def _runtime_collate(rows: list[dict[str, Any]], device: torch.device) -> dict[str, torch.Tensor]:
-    return {
+    out = {
         "track_history_boxes": torch.as_tensor(np.stack([row["track_history_boxes"] for row in rows]), dtype=torch.float32, device=device),
         "track_history_scores": torch.as_tensor(np.stack([row["track_history_scores"] for row in rows]), dtype=torch.float32, device=device),
         "track_history_class_ids": torch.as_tensor(np.stack([row["track_history_class_ids"] for row in rows]), dtype=torch.long, device=device),
@@ -218,6 +346,10 @@ def _runtime_collate(rows: list[dict[str, Any]], device: torch.device) -> dict[s
             device=device,
         ),
     }
+    if any("task_name" in row for row in rows):
+        out["task_name"] = [str(row.get("task_name", "association")) for row in rows]
+        out["candidate_mask"] = torch.as_tensor([bool(row.get("candidate_mask", True)) for row in rows], dtype=torch.bool, device=device)
+    return out
 
 
 def run_nova_tracking(
@@ -271,6 +403,86 @@ def run_nova_tracking(
             progress_bar.set_postfix(frame=f"{frame_count}/{len(ordered_infos)}")
         elif progress_interval > 0 and (frame_count == 1 or frame_count % progress_interval == 0 or frame_count == len(ordered_infos)):
             print(f"nova eval progress frames={frame_count}/{len(ordered_infos)}", flush=True)
+    if progress_bar is not None:
+        progress_bar.close()
+    return outputs, info_path
+
+
+def run_nova_lifecycle_tracking(
+    *,
+    cfg: Config,
+    model: torch.nn.Module,
+    device: torch.device,
+    split: str = "val",
+    max_frames: int = 0,
+    progress_interval: int = 50,
+    use_tqdm: bool = False,
+    desc: str = "nova lifecycle eval",
+) -> tuple[list[dict[str, Any]], Path]:
+    return _run_nova_tracking_with_tracker(
+        cfg=cfg,
+        model=model,
+        device=device,
+        split=split,
+        max_frames=max_frames,
+        progress_interval=progress_interval,
+        use_tqdm=use_tqdm,
+        desc=desc,
+        tracker_cls=NOVALifecycleOnlineTracker,
+    )
+
+
+def _run_nova_tracking_with_tracker(
+    *,
+    cfg: Config,
+    model: torch.nn.Module,
+    device: torch.device,
+    split: str,
+    max_frames: int,
+    progress_interval: int,
+    use_tqdm: bool,
+    desc: str,
+    tracker_cls: type[NOVAOnlineTracker],
+) -> tuple[list[dict[str, Any]], Path]:
+    detections = load_detection_cache(cfg, split)
+    info_path = Path(resolve_info_path(cfg, split))
+    import pickle
+
+    with info_path.open("rb") as f:
+        infos = pickle.load(f)
+    ordered_infos = sorted(infos, key=lambda x: (str(x.get("sequence_id", "")), int(x.get("frame_idx", 0))))
+    if max_frames > 0:
+        ordered_infos = ordered_infos[:max_frames]
+
+    tracker = tracker_cls(cfg, device)
+    outputs: list[dict[str, Any]] = []
+    current_sequence = None
+    model.eval()
+    progress_bar = tqdm(total=len(ordered_infos), desc=desc, dynamic_ncols=True, leave=True) if use_tqdm and tqdm is not None else None
+    for frame_count, info in enumerate(ordered_infos, start=1):
+        sequence_id = str(info.get("sequence_id", ""))
+        frame_id = str(info.get("frame_id", info.get("frame_idx", "")))
+        if sequence_id != current_sequence:
+            tracker.reset()
+            current_sequence = sequence_id
+        det = detections.get((sequence_id, frame_id))
+        if det is None:
+            det = DetectionFrame(
+                sequence_id=sequence_id,
+                frame_id=frame_id,
+                frame_idx=int(info.get("frame_idx", 0)),
+                pred_boxes=np.zeros((0, 7), dtype=np.float32),
+                pred_scores=np.zeros((0,), dtype=np.float32),
+                pred_labels=np.zeros((0,), dtype=np.int64),
+            )
+        else:
+            det = filter_eval_detections(det, float(cfg.eval.get("score_thresh", 0.0)))
+        outputs.append(tracker.update(det, model))
+        if progress_bar is not None:
+            progress_bar.update(1)
+            progress_bar.set_postfix(frame=f"{frame_count}/{len(ordered_infos)}")
+        elif progress_interval > 0 and (frame_count == 1 or frame_count % progress_interval == 0 or frame_count == len(ordered_infos)):
+            print(f"nova lifecycle eval progress frames={frame_count}/{len(ordered_infos)}", flush=True)
     if progress_bar is not None:
         progress_bar.close()
     return outputs, info_path

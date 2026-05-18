@@ -148,6 +148,19 @@ class NOVAPairIndex:
     quality_valid: bool
 
 
+@dataclass(frozen=True)
+class NOVALifecycleIndex:
+    task: str
+    seq: str
+    pos: int
+    track_id: int
+    det_idx: int
+    label: int
+    target_iou: float
+    quality_valid: bool
+    best_assoc_score: float
+
+
 class NOVAAssociationDataset(Dataset):
     def __init__(self, cfg: Config, split: str | None = None, detection_cache: dict[tuple[str, str], DetectionFrame] | None = None):
         self.cfg = cfg
@@ -358,6 +371,328 @@ class NOVAFormulator:
         )
         return "\n".join(lines)
 
+    def build_birth_prompt(
+        self,
+        *,
+        candidate_class_id: int,
+        detector_score: float,
+        best_assoc_score: float,
+    ) -> str:
+        cand_cls = self.class_name(int(candidate_class_id))
+        return "\n".join(
+            [
+                "Task: 3D Track Birth Decision",
+                "",
+                "Candidate:",
+                f"Class: {cand_cls}, Box: {self.box_token}",
+                f"Detector score: {float(detector_score):.4f}",
+                f"Best same-object probability: {float(best_assoc_score):.4f}",
+                "",
+                "Question:",
+                "What should happen to this unmatched candidate?",
+                "",
+                "Options:",
+                "Birth",
+                "Suppress",
+                "",
+                "Answer:",
+            ]
+        )
+
+    def build_lifecycle_prompt(
+        self,
+        *,
+        track_id: int,
+        lost_frames: int,
+        best_assoc_score: float,
+        history_mask: np.ndarray,
+        history_class_ids: np.ndarray,
+    ) -> str:
+        lines = [
+            "Task: 3D Track Lifecycle Decision",
+            "",
+            "Track:",
+            f"ID: {int(track_id)}",
+            f"Lost frames: {int(lost_frames)}",
+            f"Best same-object probability: {float(best_assoc_score):.4f}",
+            "",
+            "History:",
+        ]
+        history_mask = np.asarray(history_mask, dtype=np.bool_).reshape(-1)
+        history_class_ids = np.asarray(history_class_ids, dtype=np.int64).reshape(-1)
+        total = len(history_mask)
+        for slot in range(total):
+            rel = slot - total
+            if bool(history_mask[slot]):
+                cls = self.class_name(int(history_class_ids[slot]))
+                lines.append(f"Frame {rel}: ID: {int(track_id)}, Class: {cls}, Box: {self.box_token}")
+            else:
+                lines.append(f"Frame {rel}: Observation: Missing")
+        lines.extend(
+            [
+                "",
+                "Question:",
+                "What should happen to this unmatched track?",
+                "",
+                "Options:",
+                "Keep",
+                "End",
+                "",
+                "Answer:",
+            ]
+        )
+        return "\n".join(lines)
+
+
+class NOVALifecycleDataset(NOVAAssociationDataset):
+    """V2 NOVA multitask dataset: association, birth, and lifecycle decisions."""
+
+    TASK_TO_ID = {"association": 0, "birth": 1, "lifecycle": 2}
+
+    def _build_pair_index(self) -> list[NOVALifecycleIndex]:
+        association = [
+            NOVALifecycleIndex(
+                task="association",
+                seq=pair.seq,
+                pos=pair.pos,
+                track_id=pair.track_id,
+                det_idx=pair.det_idx,
+                label=pair.label,
+                target_iou=pair.target_iou,
+                quality_valid=pair.quality_valid,
+                best_assoc_score=pair.target_iou,
+            )
+            for pair in super()._build_pair_index()
+        ]
+        birth = self._build_birth_index()
+        lifecycle = self._build_lifecycle_index()
+        return association + birth + lifecycle
+
+    def __getitem__(self, item: int) -> dict[str, Any]:
+        sample = self.index[item]
+        if sample.task == "association":
+            return self._association_item(sample)
+        if sample.task == "birth":
+            return self._birth_item(sample)
+        if sample.task == "lifecycle":
+            return self._lifecycle_item(sample)
+        raise ValueError(f"Unknown NOVA lifecycle task: {sample.task}")
+
+    def _association_item(self, sample: NOVALifecycleIndex) -> dict[str, Any]:
+        base = self._association_item_from_index(sample)
+        base.update(
+            {
+                "task_name": "association",
+                "task_id": np.int64(self.TASK_TO_ID["association"]),
+                "action_label": np.int64(sample.label),
+                "candidate_mask": np.bool_(True),
+                "best_assoc_score": np.float32(sample.best_assoc_score),
+            }
+        )
+        return base
+
+    def _association_item_from_index(self, pair: NOVALifecycleIndex) -> dict[str, Any]:
+        seq_indices = self.sequences[pair.seq]
+        global_idx = seq_indices[pair.pos]
+        info = self.infos[global_idx]
+        det = self._detections_for_info(info)
+        hist = self._track_history(pair.seq, pair.pos, pair.track_id)
+        candidate_box = det.pred_boxes[pair.det_idx].astype(np.float32)
+        candidate_score = np.float32(det.pred_scores[pair.det_idx])
+        candidate_class_id = np.int64(det.pred_labels[pair.det_idx])
+        prompt_text = self.formulator.build_prompt(
+            track_id=int(pair.track_id),
+            history_mask=hist["mask"],
+            history_class_ids=hist["class_ids"],
+            candidate_class_id=int(candidate_class_id),
+        )
+        return {
+            "sequence_id": str(info.get("sequence_id", "")),
+            "frame_id": str(info.get("frame_id", info.get("frame_idx", ""))),
+            "frame_idx": int(info.get("frame_idx", 0)),
+            "track_id": int(pair.track_id),
+            "det_idx": int(pair.det_idx),
+            "track_history_boxes": hist["boxes"],
+            "track_history_scores": hist["scores"],
+            "track_history_class_ids": hist["class_ids"],
+            "track_history_mask": hist["mask"],
+            "candidate_box": candidate_box,
+            "candidate_score": candidate_score,
+            "candidate_class_id": candidate_class_id,
+            "prompt_text": prompt_text,
+            "box_token_mask": np.concatenate([hist["mask"], np.asarray([True], dtype=np.bool_)]),
+            "match_label": np.int64(pair.label),
+            "target_iou": np.float32(pair.target_iou),
+            "quality_valid": np.bool_(pair.quality_valid),
+        }
+
+    def _birth_item(self, sample: NOVALifecycleIndex) -> dict[str, Any]:
+        seq_indices = self.sequences[sample.seq]
+        info = self.infos[seq_indices[sample.pos]]
+        det = self._detections_for_info(info)
+        hist = self._empty_history()
+        candidate_class_id = np.int64(det.pred_labels[sample.det_idx])
+        prompt_text = self.formulator.build_birth_prompt(
+            candidate_class_id=int(candidate_class_id),
+            detector_score=float(det.pred_scores[sample.det_idx]),
+            best_assoc_score=float(sample.best_assoc_score),
+        )
+        return {
+            "sequence_id": str(info.get("sequence_id", "")),
+            "frame_id": str(info.get("frame_id", info.get("frame_idx", ""))),
+            "frame_idx": int(info.get("frame_idx", 0)),
+            "track_id": -1,
+            "det_idx": int(sample.det_idx),
+            "track_history_boxes": hist["boxes"],
+            "track_history_scores": hist["scores"],
+            "track_history_class_ids": hist["class_ids"],
+            "track_history_mask": hist["mask"],
+            "candidate_box": det.pred_boxes[sample.det_idx].astype(np.float32),
+            "candidate_score": np.float32(det.pred_scores[sample.det_idx]),
+            "candidate_class_id": candidate_class_id,
+            "prompt_text": prompt_text,
+            "box_token_mask": np.concatenate([hist["mask"], np.asarray([True], dtype=np.bool_)]),
+            "match_label": np.int64(sample.label),
+            "action_label": np.int64(sample.label),
+            "target_iou": np.float32(0.0),
+            "quality_valid": np.bool_(False),
+            "task_name": "birth",
+            "task_id": np.int64(self.TASK_TO_ID["birth"]),
+            "candidate_mask": np.bool_(True),
+            "best_assoc_score": np.float32(sample.best_assoc_score),
+        }
+
+    def _lifecycle_item(self, sample: NOVALifecycleIndex) -> dict[str, Any]:
+        seq_indices = self.sequences[sample.seq]
+        info = self.infos[seq_indices[sample.pos]]
+        hist = self._track_history(sample.seq, sample.pos, sample.track_id)
+        prompt_text = self.formulator.build_lifecycle_prompt(
+            track_id=int(sample.track_id),
+            lost_frames=1,
+            best_assoc_score=float(sample.best_assoc_score),
+            history_mask=hist["mask"],
+            history_class_ids=hist["class_ids"],
+        )
+        return {
+            "sequence_id": str(info.get("sequence_id", "")),
+            "frame_id": str(info.get("frame_id", info.get("frame_idx", ""))),
+            "frame_idx": int(info.get("frame_idx", 0)),
+            "track_id": int(sample.track_id),
+            "det_idx": -1,
+            "track_history_boxes": hist["boxes"],
+            "track_history_scores": hist["scores"],
+            "track_history_class_ids": hist["class_ids"],
+            "track_history_mask": hist["mask"],
+            "candidate_box": np.zeros((7,), dtype=np.float32),
+            "candidate_score": np.float32(0.0),
+            "candidate_class_id": np.int64(0),
+            "prompt_text": prompt_text,
+            "box_token_mask": np.concatenate([hist["mask"], np.asarray([False], dtype=np.bool_)]),
+            "match_label": np.int64(sample.label),
+            "action_label": np.int64(sample.label),
+            "target_iou": np.float32(0.0),
+            "quality_valid": np.bool_(False),
+            "task_name": "lifecycle",
+            "task_id": np.int64(self.TASK_TO_ID["lifecycle"]),
+            "candidate_mask": np.bool_(False),
+            "best_assoc_score": np.float32(sample.best_assoc_score),
+        }
+
+    def _build_birth_index(self) -> list[NOVALifecycleIndex]:
+        positives: list[NOVALifecycleIndex] = []
+        negatives: list[tuple[float, NOVALifecycleIndex]] = []
+        for seq, seq_indices in self.sequences.items():
+            for pos, global_idx in enumerate(seq_indices):
+                info = self.infos[global_idx]
+                det = self._detections_for_info(info)
+                if len(det.pred_boxes) == 0:
+                    continue
+                active_track_ids = self._active_track_ids(seq, pos)
+                gt = self._objects_by_global_idx[global_idx]
+                det_track_ids, det_ious = assign_detections_to_gt_tracks(gt, det, iou_threshold=self.det_gt_iou_threshold)
+                active_boxes = [self._last_track_box(seq, pos, int(track_id)) for track_id in active_track_ids]
+                best_scores = best_detection_active_iou(active_boxes, det.pred_boxes)
+                for det_idx in range(len(det.pred_boxes)):
+                    det_track_id = int(det_track_ids[det_idx])
+                    label = int(det_track_id >= 0 and det_track_id not in active_track_ids)
+                    best_assoc = max(float(best_scores[det_idx]), float(det_ious[det_idx]) if det_track_id in active_track_ids else 0.0)
+                    item = NOVALifecycleIndex(
+                        task="birth",
+                        seq=seq,
+                        pos=pos,
+                        track_id=-1,
+                        det_idx=int(det_idx),
+                        label=label,
+                        target_iou=0.0,
+                        quality_valid=False,
+                        best_assoc_score=best_assoc,
+                    )
+                    if label:
+                        positives.append(item)
+                    else:
+                        negatives.append((float(det.pred_scores[det_idx]), item))
+        if self.negative_positive_ratio > 0.0 and positives:
+            keep_neg = min(len(negatives), int(np.ceil(len(positives) * self.negative_positive_ratio)))
+            kept_negatives = [item for _score, item in sorted(negatives, key=lambda pair: pair[0], reverse=True)[:keep_neg]]
+        else:
+            kept_negatives = [item for _score, item in negatives]
+        return positives + kept_negatives
+
+    def _build_lifecycle_index(self) -> list[NOVALifecycleIndex]:
+        items: list[NOVALifecycleIndex] = []
+        future_by_seq: dict[str, list[set[int]]] = {}
+        for seq, seq_indices in self.sequences.items():
+            future: list[set[int]] = [set() for _ in seq_indices]
+            seen: set[int] = set()
+            for rev_pos in range(len(seq_indices) - 1, -1, -1):
+                future[rev_pos] = set(seen)
+                objects = self._objects_by_global_idx[seq_indices[rev_pos]]
+                seen.update(int(track_id) for track_id in objects.track_ids.tolist() if int(track_id) >= 0)
+            future_by_seq[seq] = future
+
+        for seq, seq_indices in self.sequences.items():
+            for pos, global_idx in enumerate(seq_indices):
+                current_objects = self._objects_by_global_idx[global_idx]
+                current_ids = {int(track_id) for track_id in current_objects.track_ids.tolist() if int(track_id) >= 0}
+                for track_id in sorted(self._active_track_ids(seq, pos)):
+                    if int(track_id) in current_ids:
+                        continue
+                    label = int(int(track_id) in future_by_seq[seq][pos])
+                    items.append(
+                        NOVALifecycleIndex(
+                            task="lifecycle",
+                            seq=seq,
+                            pos=pos,
+                            track_id=int(track_id),
+                            det_idx=-1,
+                            label=label,
+                            target_iou=0.0,
+                            quality_valid=False,
+                            best_assoc_score=0.0,
+                        )
+                    )
+        return self._sample_lifecycle_items(items)
+
+    def _sample_lifecycle_items(self, items: list[NOVALifecycleIndex]) -> list[NOVALifecycleIndex]:
+        keeps = [item for item in items if item.label == 1]
+        ends = [item for item in items if item.label == 0]
+        if not keeps or not ends or self.negative_positive_ratio <= 0.0:
+            return items
+        if len(keeps) <= len(ends):
+            minority, majority = keeps, ends
+        else:
+            minority, majority = ends, keeps
+        keep_majority = int(np.ceil(len(minority) * self.negative_positive_ratio))
+        return minority + majority[:keep_majority]
+
+    def _empty_history(self) -> dict[str, np.ndarray]:
+        return {
+            "boxes": np.zeros((self.history_len, 7), dtype=np.float32),
+            "scores": np.zeros((self.history_len,), dtype=np.float32),
+            "class_ids": np.zeros((self.history_len,), dtype=np.int64),
+            "mask": np.zeros((self.history_len,), dtype=np.bool_),
+        }
+
 
 def assign_detections_to_gt_tracks(
     gt: ObjectFrame,
@@ -383,6 +718,15 @@ def hard_negative_distance(track_box: np.ndarray | None, det_box: np.ndarray) ->
     track_box = np.asarray(track_box, dtype=np.float32).reshape(-1)
     det_box = np.asarray(det_box, dtype=np.float32).reshape(-1)
     return float(np.linalg.norm(track_box[:2] - det_box[:2]))
+
+
+def best_detection_active_iou(active_boxes: list[np.ndarray | None], det_boxes: np.ndarray) -> np.ndarray:
+    valid_boxes = [np.asarray(box, dtype=np.float32).reshape(7) for box in active_boxes if box is not None]
+    det_boxes = np.asarray(det_boxes, dtype=np.float32).reshape(-1, 7)
+    if not valid_boxes or len(det_boxes) == 0:
+        return np.zeros((len(det_boxes),), dtype=np.float32)
+    ious = boxes_iou_3d_axis_aligned(np.stack(valid_boxes).astype(np.float32), det_boxes)
+    return ious.max(axis=0).astype(np.float32) if ious.size else np.zeros((len(det_boxes),), dtype=np.float32)
 
 
 def _match_by_iou(iou: np.ndarray, threshold: float) -> list[tuple[int, int, float]]:
@@ -418,7 +762,7 @@ def _match_by_iou(iou: np.ndarray, threshold: float) -> list[tuple[int, int, flo
 
 
 def nova_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+    out = {
         "sequence_id": [sample["sequence_id"] for sample in batch],
         "frame_id": [sample["frame_id"] for sample in batch],
         "frame_idx": torch.tensor([sample["frame_idx"] for sample in batch], dtype=torch.long),
@@ -448,3 +792,10 @@ def nova_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "target_iou": torch.as_tensor([sample["target_iou"] for sample in batch], dtype=torch.float32),
         "quality_valid": torch.as_tensor([bool(sample["quality_valid"]) for sample in batch], dtype=torch.bool),
     }
+    if any("task_name" in sample for sample in batch):
+        out["task_name"] = [str(sample.get("task_name", "association")) for sample in batch]
+        out["task_id"] = torch.as_tensor([sample.get("task_id", 0) for sample in batch], dtype=torch.long)
+        out["action_label"] = torch.as_tensor([sample.get("action_label", sample["match_label"]) for sample in batch], dtype=torch.long)
+        out["candidate_mask"] = torch.as_tensor([bool(sample.get("candidate_mask", True)) for sample in batch], dtype=torch.bool)
+        out["best_assoc_score"] = torch.as_tensor([sample.get("best_assoc_score", sample["target_iou"]) for sample in batch], dtype=torch.float32)
+    return out

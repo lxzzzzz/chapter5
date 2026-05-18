@@ -9,12 +9,13 @@ from generative_tracking.config import load_config
 from generative_tracking.nova_data import (
     DetectionFrame,
     NOVAAssociationDataset,
+    NOVALifecycleDataset,
     filter_detection_frame,
     nova_collate,
     validate_detection_frame,
 )
-from generative_tracking.nova_model import NOVAAssociationModel
-from generative_tracking.nova_runtime import NOVAOnlineTracker, associate_by_scores
+from generative_tracking.nova_model import NOVAAssociationModel, NOVALifecycleModel
+from generative_tracking.nova_runtime import NOVALifecycleOnlineTracker, NOVAOnlineTracker, associate_by_scores
 
 
 def _box(x, y=0.0):
@@ -108,6 +109,47 @@ class NOVATest(unittest.TestCase):
             self.assertEqual(tuple(batch["box_token_mask"].shape), (2, 3))
             self.assertEqual(batch["box_token_mask"][0].tolist(), [False, True, True])
 
+    def test_lifecycle_dataset_labels_and_prompts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            info_path = f"{tmpdir}/tracking_infos_train.pkl"
+            infos = [
+                _info(0, [(1, _box(0.0))]),
+                _info(1, [(1, _box(1.0)), (2, _box(10.0))]),
+                _info(2, [(1, _box(2.0))]),
+                _info(3, [(2, _box(12.0))]),
+            ]
+            with open(info_path, "wb") as f:
+                pickle.dump(infos, f)
+            cfg = _cfg(info_path)
+            detections = {
+                ("seq0", "000000"): DetectionFrame("seq0", "000000", 0, np.stack([_box(0.0)]), np.asarray([0.9], dtype=np.float32), np.asarray([0], dtype=np.int64)),
+                ("seq0", "000001"): DetectionFrame(
+                    "seq0",
+                    "000001",
+                    1,
+                    np.stack([_box(1.0), _box(10.0), _box(30.0)]).astype(np.float32),
+                    np.asarray([0.9, 0.8, 0.95], dtype=np.float32),
+                    np.asarray([0, 0, 0], dtype=np.int64),
+                ),
+                ("seq0", "000002"): DetectionFrame("seq0", "000002", 2, np.stack([_box(2.0)]), np.asarray([0.9], dtype=np.float32), np.asarray([0], dtype=np.int64)),
+                ("seq0", "000003"): DetectionFrame("seq0", "000003", 3, np.stack([_box(12.0)]), np.asarray([0.9], dtype=np.float32), np.asarray([0], dtype=np.int64)),
+            }
+            dataset = NOVALifecycleDataset(cfg, split="train", detection_cache=detections)
+            birth_labels = {sample["det_idx"]: int(sample["action_label"]) for sample in (dataset[i] for i in range(len(dataset))) if sample["task_name"] == "birth" and sample["frame_idx"] == 1}
+            self.assertEqual(birth_labels[0], 0)
+            self.assertEqual(birth_labels[1], 1)
+            self.assertEqual(birth_labels[2], 0)
+
+            lifecycle = [dataset[i] for i in range(len(dataset)) if dataset[i]["task_name"] == "lifecycle"]
+            labels_by_frame_track = {(sample["frame_idx"], sample["track_id"]): int(sample["action_label"]) for sample in lifecycle}
+            self.assertEqual(labels_by_frame_track[(2, 2)], 1)
+            self.assertEqual(labels_by_frame_track[(3, 1)], 0)
+            birth_sample = next(sample for sample in (dataset[i] for i in range(len(dataset))) if sample["task_name"] == "birth")
+            self.assertEqual(birth_sample["prompt_text"].count("<box>"), 1)
+            lifecycle_sample = next(sample for sample in lifecycle if sample["track_id"] == 2)
+            self.assertEqual(lifecycle_sample["prompt_text"].count("<box>"), int(lifecycle_sample["box_token_mask"].sum()))
+            self.assertNotIn("Observation: Missing, Box:", lifecycle_sample["prompt_text"])
+
     def test_model_forward_shapes_and_loss(self):
         cfg = load_config(
             overrides={
@@ -139,6 +181,40 @@ class NOVATest(unittest.TestCase):
         self.assertEqual(tuple(out["match_logits"].shape), (4, 2))
         self.assertEqual(tuple(out["quality"].shape), (4,))
         self.assertTrue(bool(torch.isfinite(out["loss"])))
+
+    def test_lifecycle_model_forward_shapes_and_loss(self):
+        cfg = load_config(
+            overrides={
+                "device": "cpu",
+                "dataset": {"box_center_range": [-20.0, -20.0, -5.0, 40.0, 20.0, 5.0]},
+                "nova": {"history_len": 3, "geometry_hidden_size": 32},
+                "model": {
+                    "use_mock_llm": True,
+                    "mock_llm_hidden_size": 32,
+                    "mock_llm_layers": 1,
+                    "num_attention_heads": 4,
+                },
+            }
+        )
+        model = NOVALifecycleModel(cfg)
+        batch = {
+            "track_history_boxes": torch.zeros(6, 3, 7),
+            "track_history_scores": torch.ones(6, 3),
+            "track_history_class_ids": torch.zeros(6, 3, dtype=torch.long),
+            "track_history_mask": torch.tensor([[1, 1, 1], [0, 0, 0], [1, 0, 1], [1, 1, 1], [0, 0, 0], [1, 1, 0]], dtype=torch.bool),
+            "candidate_box": torch.zeros(6, 7),
+            "candidate_score": torch.ones(6),
+            "candidate_class_id": torch.zeros(6, dtype=torch.long),
+            "candidate_mask": torch.tensor([1, 1, 0, 1, 1, 0], dtype=torch.bool),
+            "task_name": ["association", "birth", "lifecycle", "association", "birth", "lifecycle"],
+            "action_label": torch.tensor([1, 0, 1, 0, 1, 0], dtype=torch.long),
+            "target_iou": torch.tensor([0.9, 0.0, 0.0, 0.8, 0.0, 0.0]),
+            "quality_valid": torch.tensor([True, False, False, True, False, False]),
+        }
+        out = model(batch)
+        self.assertEqual(tuple(out["action_logits"].shape), (6, 2))
+        self.assertTrue(bool(torch.isfinite(out["loss"])))
+        self.assertTrue(bool(torch.isfinite(out["L_quality"])))
 
     def test_hungarian_and_tracker_lifecycle(self):
         scores = np.asarray([[0.9, 0.1], [0.2, 0.8]], dtype=np.float32)
@@ -179,6 +255,39 @@ class NOVATest(unittest.TestCase):
         self.assertEqual([track["id"] for track in out2["tracks"]], [0])
         self.assertEqual(tracker.tracks[1].lost_frames, 1)
 
+    def test_lifecycle_runtime_birth_keep_end_and_hard_cap(self):
+        cfg = load_config(
+            overrides={
+                "dataset": {"class_names": ["Car"]},
+                "nova": {"history_len": 2, "association_threshold": 0.5, "max_lost_frames": 1},
+            }
+        )
+        tracker = NOVALifecycleOnlineTracker(cfg, torch.device("cpu"))
+        frame0 = DetectionFrame(
+            "seq0",
+            "000000",
+            0,
+            np.stack([_box(0.0), _box(10.0)]),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+            np.asarray([0, 0], dtype=np.int64),
+        )
+        out0 = tracker.update(frame0, _DummyLifecycleModel(assoc=[], birth=[1, 0], lifecycle=[]))
+        self.assertEqual([track["id"] for track in out0["tracks"]], [0])
+
+        frame1 = DetectionFrame("seq0", "000001", 1, np.zeros((0, 7), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int64))
+        out1 = tracker.update(frame1, _DummyLifecycleModel(assoc=[], birth=[], lifecycle=[1]))
+        self.assertEqual(out1["tracks"], [])
+        self.assertIn(0, tracker.tracks)
+        self.assertEqual(tracker.tracks[0].lost_frames, 1)
+
+        out2 = tracker.update(frame1, _DummyLifecycleModel(assoc=[], birth=[], lifecycle=[1]))
+        self.assertNotIn(0, tracker.tracks)
+
+        tracker.update(frame0, _DummyLifecycleModel(assoc=[], birth=[1, 0], lifecycle=[]))
+        out3 = tracker.update(frame1, _DummyLifecycleModel(assoc=[], birth=[], lifecycle=[0]))
+        self.assertEqual(out3["tracks"], [])
+        self.assertEqual(tracker.tracks, {})
+
 
 class _DummyScores(torch.nn.Module):
     def __init__(self, scores):
@@ -187,6 +296,29 @@ class _DummyScores(torch.nn.Module):
 
     def forward(self, batch):
         return {"match_prob": self.scores[: batch["candidate_box"].shape[0]]}
+
+
+class _DummyLifecycleModel(torch.nn.Module):
+    def __init__(self, assoc, birth, lifecycle):
+        super().__init__()
+        self.values = {
+            "association": list(assoc),
+            "birth": list(birth),
+            "lifecycle": list(lifecycle),
+        }
+
+    def forward(self, batch):
+        task_names = batch.get("task_name", ["association"] * batch["candidate_box"].shape[0])
+        logits = []
+        probs = []
+        for task_name in task_names:
+            value = self.values[str(task_name)].pop(0)
+            probs.append(float(value))
+            logits.append([-1.0, 1.0] if int(value) == 1 else [1.0, -1.0])
+        return {
+            "match_prob": torch.as_tensor(probs, dtype=torch.float32),
+            "action_logits": torch.as_tensor(logits, dtype=torch.float32),
+        }
 
 
 if __name__ == "__main__":
