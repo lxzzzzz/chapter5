@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress_interval", type=int, default=50)
     parser.add_argument("--output", default=None)
     parser.add_argument("--eval_metrics", action="store_true")
+    parser.add_argument("--eval_score_thresh", type=float, default=None, help="Override eval.score_thresh for cached detection filtering.")
+    parser.add_argument("--association_threshold", type=float, default=None, help="Override nova.association_threshold for accepting Hungarian matches.")
     return parser.parse_args()
 
 
@@ -36,6 +38,10 @@ def load_model_checkpoint(path: Path, model: torch.nn.Module, device: torch.devi
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.cfg_file)
+    if args.eval_score_thresh is not None:
+        cfg.eval.score_thresh = float(args.eval_score_thresh)
+    if args.association_threshold is not None:
+        cfg.nova.association_threshold = float(args.association_threshold)
     device = select_device(str(cfg.device))
     model = NOVAAssociationModel(cfg).to(device)
     ckpt_arg = args.ckpt if args.ckpt is not None else str(cfg.eval.get("checkpoint", ""))
@@ -55,6 +61,8 @@ def main() -> None:
         split=str(args.split),
         max_frames=0 if args.max_frames is None else int(args.max_frames),
         progress_interval=max(1, int(args.progress_interval)),
+        use_tqdm=True,
+        desc=f"nova eval {args.split}",
     )
     output_path = Path(args.output or Path(cfg.output_dir) / "tracking_results.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress_interval", type=int, default=50)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--save_full_state", action="store_true")
+    parser.add_argument("--eval_score_thresh", type=float, default=None, help="Override eval.score_thresh used during validation.")
+    parser.add_argument("--association_threshold", type=float, default=None, help="Override nova.association_threshold used during validation.")
     return parser.parse_args()
 
 
@@ -191,6 +193,10 @@ def main() -> None:
         cfg.train.resume = args.resume
     if args.save_full_state:
         cfg.train.save_trainable_only = False
+    if args.eval_score_thresh is not None:
+        cfg.eval.score_thresh = float(args.eval_score_thresh)
+    if args.association_threshold is not None:
+        cfg.nova.association_threshold = float(args.association_threshold)
 
     random.seed(int(cfg.seed))
     np.random.seed(int(cfg.seed))

@@ -263,6 +263,8 @@ def run_nova_tracking(
                 pred_scores=np.zeros((0,), dtype=np.float32),
                 pred_labels=np.zeros((0,), dtype=np.int64),
             )
+        else:
+            det = filter_eval_detections(det, float(cfg.eval.get("score_thresh", 0.0)))
         outputs.append(tracker.update(det, model))
         if progress_bar is not None:
             progress_bar.update(1)
@@ -272,3 +274,17 @@ def run_nova_tracking(
     if progress_bar is not None:
         progress_bar.close()
     return outputs, info_path
+
+
+def filter_eval_detections(det: DetectionFrame, score_thresh: float) -> DetectionFrame:
+    if score_thresh <= 0.0 or len(det.pred_scores) == 0:
+        return det
+    keep = np.asarray(det.pred_scores >= float(score_thresh), dtype=bool)
+    return DetectionFrame(
+        sequence_id=det.sequence_id,
+        frame_id=det.frame_id,
+        frame_idx=det.frame_idx,
+        pred_boxes=det.pred_boxes[keep],
+        pred_scores=det.pred_scores[keep],
+        pred_labels=det.pred_labels[keep],
+    )
