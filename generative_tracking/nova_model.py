@@ -193,7 +193,7 @@ class NOVAAssociationModel(nn.Module):
         logits = output.logits[row_idx, answer_pos]
         match_logits = torch.stack([logits[:, int(self.no_token_id)], logits[:, int(self.yes_token_id)]], dim=-1)
         hidden = output.hidden_states[-1][row_idx, answer_pos]
-        return match_logits, self.norm(hidden)
+        return match_logits.to(dtype=self.norm.weight.dtype), self.norm(hidden.to(dtype=self.norm.weight.dtype))
 
     def _inject_box_embeddings(
         self,
