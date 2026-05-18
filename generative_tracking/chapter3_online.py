@@ -102,8 +102,14 @@ class OnlineChapter3Detector:
                     raw = self.dataset[index]
                     batch_dict = self.dataset.collate_batch([raw])
                     self.load_data_to_gpu(batch_dict)
-                    self.model(batch_dict)
-                    tokens = extract_detector_frame_tokens(batch_dict, self.max_tokens)
+                    model_out = self.model(batch_dict)
+                    _attach_model_outputs(batch_dict, model_out)
+                    try:
+                        tokens = extract_detector_frame_tokens(batch_dict, self.max_tokens)
+                    except KeyError as exc:
+                        raise KeyError(
+                            f"{exc}\nAvailable detector outputs: {_describe_detector_outputs(batch_dict)}"
+                        ) from exc
                     cur = tokens[0] if tokens else np.zeros((0, token_dim), dtype=np.float32)
                     if cur.ndim == 1:
                         cur = cur.reshape(1, -1)
@@ -149,3 +155,41 @@ def _pad_concat_tokens(tokens_per_frame: list[np.ndarray], max_tokens: int, toke
         out[start:start + n] = torch.as_tensor(tokens[:n], dtype=torch.float32)
         mask[start:start + n] = True
     return out, mask
+
+
+def _attach_model_outputs(batch_dict: dict[str, Any], model_out: Any) -> None:
+    if isinstance(model_out, tuple) and model_out:
+        first = model_out[0]
+        if isinstance(first, list):
+            batch_dict.setdefault("pred_dicts", first)
+        elif isinstance(first, dict):
+            batch_dict.setdefault("pred_dicts", first)
+    elif isinstance(model_out, list):
+        batch_dict.setdefault("pred_dicts", model_out)
+    elif isinstance(model_out, dict):
+        for key, value in model_out.items():
+            batch_dict.setdefault(key, value)
+
+
+def _describe_detector_outputs(batch_dict: dict[str, Any]) -> str:
+    parts = [f"batch_dict keys={sorted(str(key) for key in batch_dict.keys())}"]
+    pred_dicts = batch_dict.get("pred_dicts")
+    if isinstance(pred_dicts, list):
+        parts.append(f"pred_dicts list length={len(pred_dicts)}")
+        if pred_dicts and isinstance(pred_dicts[0], dict):
+            parts.append(f"pred_dicts[0] keys={sorted(str(key) for key in pred_dicts[0].keys())}")
+            tensor_shapes = {
+                str(key): tuple(value.shape)
+                for key, value in pred_dicts[0].items()
+                if isinstance(value, torch.Tensor)
+            }
+            parts.append(f"pred_dicts[0] tensor_shapes={tensor_shapes}")
+    elif isinstance(pred_dicts, dict):
+        parts.append(f"pred_dicts keys={sorted(str(key) for key in pred_dicts.keys())}")
+        tensor_shapes = {
+            str(key): tuple(value.shape)
+            for key, value in pred_dicts.items()
+            if isinstance(value, torch.Tensor)
+        }
+        parts.append(f"pred_dicts tensor_shapes={tensor_shapes}")
+    return "; ".join(parts)
