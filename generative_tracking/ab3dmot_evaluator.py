@@ -29,6 +29,7 @@ class ClearMotMetrics:
     precision: float
     mota: float
     motp: float
+    matched_scores: tuple[float, ...] = ()
 
 
 def evaluate_ab3dmot_json(
@@ -40,8 +41,17 @@ def evaluate_ab3dmot_json(
     output_path: str | Path | None = None,
 ) -> dict[str, float | list[dict[str, float]]]:
     records = _load_records(result_json, info_path, class_names)
-    all_scores = sorted({float(score) for record in records for score in record["pred_scores"].tolist()}, reverse=True)
-    thresholds = [float("inf"), *all_scores, -float("inf")]
+    full_metrics = _clear_mot_at_threshold(
+        records,
+        iou_threshold=iou_threshold,
+        score_threshold=-float("inf"),
+        collect_matched_scores=True,
+    )
+    thresholds = _thresholds_from_matched_scores(
+        full_metrics.matched_scores,
+        total_gt=full_metrics.num_gt,
+        recall_points=recall_points,
+    )
     curves: list[tuple[float, ClearMotMetrics]] = []
     seen_recalls: set[float] = set()
     for threshold in thresholds:
@@ -53,7 +63,6 @@ def evaluate_ab3dmot_json(
         curves.append((threshold, metrics))
     curves.sort(key=lambda item: item[1].recall)
 
-    full_metrics = _clear_mot_at_threshold(records, iou_threshold=iou_threshold, score_threshold=-float("inf"))
     target_recalls = np.linspace(1.0 / int(recall_points), 1.0, int(recall_points), dtype=np.float32)
     sampled = [_sample_curve_at_recall(curves, float(target)) for target in target_recalls]
     num_gt = max(full_metrics.num_gt, 1)
@@ -156,6 +165,7 @@ def _clear_mot_at_threshold(
     *,
     iou_threshold: float,
     score_threshold: float,
+    collect_matched_scores: bool = False,
 ) -> ClearMotMetrics:
     total_gt = 0
     total_pred = 0
@@ -165,6 +175,7 @@ def _clear_mot_at_threshold(
     id_switches = 0
     fragments = 0
     motp_sum = 0.0
+    matched_scores: list[float] = []
     gt_track_total: dict[tuple[str, int], int] = defaultdict(int)
     gt_track_matched: dict[tuple[str, int], int] = defaultdict(int)
     gt_track_was_matched: dict[tuple[str, int], bool] = defaultdict(bool)
@@ -192,6 +203,8 @@ def _clear_mot_at_threshold(
         for gt_idx, pred_idx, _score in matches:
             gt_key = (seq, int(gt_ids[gt_idx]))
             pred_id = int(pred_ids[pred_idx])
+            if collect_matched_scores:
+                matched_scores.append(float(record["pred_scores"][keep][pred_idx]))
             last_pred = gt_to_pred_last.get(gt_key)
             if last_pred is not None and last_pred != pred_id:
                 id_switches += 1
@@ -233,7 +246,27 @@ def _clear_mot_at_threshold(
         precision=precision,
         mota=mota,
         motp=motp,
+        matched_scores=tuple(matched_scores),
     )
+
+
+def _thresholds_from_matched_scores(
+    matched_scores: tuple[float, ...],
+    *,
+    total_gt: int,
+    recall_points: int,
+) -> list[float]:
+    if not matched_scores:
+        return [float("inf"), -float("inf")]
+    scores = sorted((float(score) for score in matched_scores), reverse=True)
+    thresholds = [float("inf")]
+    total_gt = max(int(total_gt), 1)
+    for target in np.linspace(1.0 / int(recall_points), 1.0, int(recall_points), dtype=np.float32):
+        target_tp = int(np.ceil(float(target) * total_gt))
+        idx = min(max(target_tp - 1, 0), len(scores) - 1)
+        thresholds.append(scores[idx])
+    thresholds.append(-float("inf"))
+    return sorted(set(thresholds), reverse=True)
 
 
 def _sample_curve_at_recall(
