@@ -109,7 +109,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "association_threshold": 0.5,
         "max_lost_frames": 2,
         "geometry_hidden_size": 128,
-        "negative_positive_ratio": 0.0,
+        "negative_positive_ratio": 3.0,
         "box_token": "<box>",
         "yes_token": "Yes",
         "no_token": "No",

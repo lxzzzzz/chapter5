@@ -218,7 +218,6 @@ class NOVAAssociationDataset(Dataset):
 
     def _build_pair_index(self) -> list[NOVAPairIndex]:
         pairs: list[NOVAPairIndex] = []
-        rng = random.Random(int(self.cfg.seed) + (0 if self.split == "train" else 100000))
         for seq, seq_indices in self.sequences.items():
             for pos, global_idx in enumerate(seq_indices):
                 info = self.infos[global_idx]
@@ -235,8 +234,9 @@ class NOVAAssociationDataset(Dataset):
                     iou_threshold=self.det_gt_iou_threshold,
                 )
                 positives: list[NOVAPairIndex] = []
-                negatives: list[NOVAPairIndex] = []
+                negatives: list[tuple[float, NOVAPairIndex]] = []
                 for track_id in active_track_ids:
+                    track_ref_box = self._last_track_box(seq, pos, int(track_id))
                     for det_idx in range(len(det.pred_boxes)):
                         det_track_id = int(det_track_ids[det_idx])
                         label = int(det_track_id >= 0 and det_track_id == int(track_id))
@@ -252,12 +252,14 @@ class NOVAAssociationDataset(Dataset):
                         if label:
                             positives.append(pair)
                         else:
-                            negatives.append(pair)
+                            negatives.append((hard_negative_distance(track_ref_box, det.pred_boxes[det_idx]), pair))
                 if self.negative_positive_ratio > 0.0 and positives:
                     keep_neg = min(len(negatives), int(np.ceil(len(positives) * self.negative_positive_ratio)))
-                    negatives = rng.sample(negatives, keep_neg) if keep_neg < len(negatives) else negatives
+                    negative_pairs = [pair for _dist, pair in sorted(negatives, key=lambda item: item[0])[:keep_neg]]
+                else:
+                    negative_pairs = [pair for _dist, pair in negatives]
                 pairs.extend(positives)
-                pairs.extend(negatives)
+                pairs.extend(negative_pairs)
         return pairs
 
     def _detections_for_info(self, info: dict[str, Any]) -> DetectionFrame:
@@ -297,6 +299,18 @@ class NOVAAssociationDataset(Dataset):
             class_ids[slot] = objects.class_ids[obj_idx]
             mask[slot] = True
         return {"boxes": boxes, "scores": scores, "class_ids": class_ids, "mask": mask}
+
+    def _last_track_box(self, seq: str, pos: int, track_id: int) -> np.ndarray | None:
+        seq_indices = self.sequences[seq]
+        for slot in range(self.history_len):
+            hist_pos = pos - (slot + 1) * self.history_stride
+            if hist_pos < 0:
+                continue
+            objects = self._objects_by_global_idx[seq_indices[hist_pos]]
+            matches = np.where(objects.track_ids == int(track_id))[0]
+            if len(matches):
+                return objects.boxes[int(matches[0])]
+        return None
 
 
 class NOVAFormulator:
@@ -361,6 +375,14 @@ def assign_detections_to_gt_tracks(
         det_track_ids[det_idx] = int(gt.track_ids[gt_idx])
         det_ious[det_idx] = float(score)
     return det_track_ids, det_ious
+
+
+def hard_negative_distance(track_box: np.ndarray | None, det_box: np.ndarray) -> float:
+    if track_box is None:
+        return float("inf")
+    track_box = np.asarray(track_box, dtype=np.float32).reshape(-1)
+    det_box = np.asarray(det_box, dtype=np.float32).reshape(-1)
+    return float(np.linalg.norm(track_box[:2] - det_box[:2]))
 
 
 def _match_by_iou(iou: np.ndarray, threshold: float) -> list[tuple[int, int, float]]:
