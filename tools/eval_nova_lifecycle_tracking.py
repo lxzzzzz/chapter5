@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ab3dmot_recall_points", type=int, default=40)
     parser.add_argument("--eval_score_thresh", type=float, default=None)
     parser.add_argument("--association_threshold", type=float, default=None)
+    parser.add_argument("--max_lost_frames", type=int, default=None)
     return parser.parse_args()
 
 
@@ -40,6 +41,9 @@ def main() -> None:
         cfg.eval.score_thresh = float(args.eval_score_thresh)
     if args.association_threshold is not None:
         cfg.nova.association_threshold = float(args.association_threshold)
+    if args.max_lost_frames is not None:
+        cfg.nova.max_lost_frames = int(args.max_lost_frames)
+        cfg.eval.max_lost_frames = int(args.max_lost_frames)
     device = select_device(str(cfg.device))
     model = NOVALifecycleModel(cfg).to(device)
     ckpt_arg = args.ckpt if args.ckpt is not None else str(cfg.eval.get("checkpoint", ""))

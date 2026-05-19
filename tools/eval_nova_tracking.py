@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ab3dmot_recall_points", type=int, default=40)
     parser.add_argument("--eval_score_thresh", type=float, default=None, help="Override eval.score_thresh for cached detection filtering.")
     parser.add_argument("--association_threshold", type=float, default=None, help="Override nova.association_threshold for accepting Hungarian matches.")
+    parser.add_argument("--max_lost_frames", type=int, default=None, help="Override nova.max_lost_frames hard cap for unmatched tracks.")
     return parser.parse_args()
 
 
@@ -46,6 +47,9 @@ def main() -> None:
         cfg.eval.score_thresh = float(args.eval_score_thresh)
     if args.association_threshold is not None:
         cfg.nova.association_threshold = float(args.association_threshold)
+    if args.max_lost_frames is not None:
+        cfg.nova.max_lost_frames = int(args.max_lost_frames)
+        cfg.eval.max_lost_frames = int(args.max_lost_frames)
     device = select_device(str(cfg.device))
     model = NOVAAssociationModel(cfg).to(device)
     ckpt_arg = args.ckpt if args.ckpt is not None else str(cfg.eval.get("checkpoint", ""))
