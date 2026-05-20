@@ -1,0 +1,26 @@
+chapter3_root: /media/ana-4090/LY/chapter3
+detector_cfg_file: /media/ana-4090/LY/chapter3/tools/cfgs/custom_models/voxelnext_v2x_real_lidar.yaml
+detector_ckpt: /media/ana-4090/LY/chapter3/output/cfgs/custom_models/voxelnext_v2x_real_lidar/default/ckpt/checkpoint_epoch_10.pth
+
+dataset:
+  name: v2x_real
+  split: train
+  class_names: [Car]
+
+detection_cache:
+  root: outputs/ab3dmot_v2x_real/detection_cache
+  paths: {}
+  score_thresh: 0.05
+  max_dets_per_frame: 100
+  class_name: Car
+
+eval:
+  score_thresh: 0.6
+  max_lost_frames: 2
+
+evaluator:
+  enabled: true
+  iou_threshold: 0.5
+  metrics_path: outputs/ab3dmot_v2x_real/tracking_metrics.json
+
+output_dir: outputs/ab3dmot_v2x_real
