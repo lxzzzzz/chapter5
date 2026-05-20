@@ -5,7 +5,13 @@ detector_ckpt: /media/ana-4090/LY/chapter3/output/cfgs/custom_models/voxelnext_v
 dataset:
   name: v2x_real
   split: train
+  K: 3
+  stride: 1
+  max_objects: 64
   class_names: [Car]
+  box_center_range: [-102.4, -40.0, -15.0, 102.4, 40.0, 15.0]
+  box_size_scale: [10.0, 10.0, 5.0]
+  box_yaw_scale: 3.141592653589793
 
 detection_cache:
   root: outputs/ab3dmot_v2x_real/detection_cache
