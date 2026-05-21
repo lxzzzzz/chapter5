@@ -52,12 +52,16 @@ class SimpleAB3DMOT:
         max_lost_frames: int,
         min_hits: int,
         dt_hypotheses: list[float] | None = None,
+        init_velocity_mode: str = "zero",
+        init_speed_prior: float = 0.0,
     ) -> None:
         self.class_names = class_names
         self.iou_threshold = float(iou_threshold)
         self.max_lost_frames = int(max_lost_frames)
         self.min_hits = int(min_hits)
         self.dt_hypotheses = _normalize_dt_hypotheses(dt_hypotheses)
+        self.init_velocity_mode = str(init_velocity_mode)
+        self.init_speed_prior = float(init_speed_prior)
         self.next_id = 0
         self.tracks: dict[int, AB3DTrack] = {}
 
@@ -135,7 +139,11 @@ class SimpleAB3DMOT:
         self.tracks[track_id] = AB3DTrack(
             track_id=track_id,
             box=det.pred_boxes[det_idx].astype(np.float32),
-            velocity=np.zeros((7,), dtype=np.float32),
+            velocity=_initial_velocity_from_box(
+                det.pred_boxes[det_idx],
+                mode=self.init_velocity_mode,
+                speed_prior=self.init_speed_prior,
+            ),
             score=float(det.pred_scores[det_idx]),
             class_id=int(det.pred_labels[det_idx]),
         )
@@ -177,6 +185,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_lost_frames", type=int, default=2)
     parser.add_argument("--min_hits", type=int, default=1)
     parser.add_argument("--dt_hypotheses", type=float, nargs="+", default=None)
+    parser.add_argument("--init_velocity_mode", choices=["zero", "heading_prior"], default="zero")
+    parser.add_argument("--init_speed_prior", type=float, default=0.0)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--progress_interval", type=int, default=50)
     parser.add_argument("--eval_metrics", action="store_true")
@@ -211,6 +221,8 @@ def main() -> None:
         max_lost_frames=int(args.max_lost_frames),
         min_hits=int(args.min_hits),
         dt_hypotheses=args.dt_hypotheses,
+        init_velocity_mode=str(args.init_velocity_mode),
+        init_speed_prior=float(args.init_speed_prior),
         max_frames=int(args.max_frames),
         progress_interval=max(1, int(args.progress_interval)),
     )
@@ -277,6 +289,8 @@ def run_ab3dmot(
     max_lost_frames: int,
     min_hits: int,
     dt_hypotheses: list[float] | None,
+    init_velocity_mode: str,
+    init_speed_prior: float,
     max_frames: int,
     progress_interval: int,
 ) -> tuple[list[dict[str, Any]], Path]:
@@ -294,6 +308,8 @@ def run_ab3dmot(
         max_lost_frames=max_lost_frames,
         min_hits=min_hits,
         dt_hypotheses=dt_hypotheses,
+        init_velocity_mode=init_velocity_mode,
+        init_speed_prior=init_speed_prior,
     )
     outputs: list[dict[str, Any]] = []
     current_sequence = None
@@ -422,6 +438,16 @@ def _normalize_dt_hypotheses(dt_hypotheses: list[float] | None) -> list[float]:
         normalized.insert(0, 1.0)
     normalized.sort(key=lambda value: (abs(value - 1.0) > 1e-6, value))
     return normalized
+
+
+def _initial_velocity_from_box(box: np.ndarray, *, mode: str, speed_prior: float) -> np.ndarray:
+    velocity = np.zeros((7,), dtype=np.float32)
+    if str(mode) != "heading_prior" or float(speed_prior) <= 0:
+        return velocity
+    yaw = float(np.asarray(box, dtype=np.float32).reshape(-1)[6])
+    velocity[0] = float(np.cos(yaw) * float(speed_prior))
+    velocity[1] = float(np.sin(yaw) * float(speed_prior))
+    return velocity
 
 
 if __name__ == "__main__":

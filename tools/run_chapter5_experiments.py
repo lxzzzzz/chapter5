@@ -171,6 +171,7 @@ def _tracking_command(
         "--eval_ab3dmot",
     ]
     _append_dt_hypotheses(common, defaults)
+    _append_motion_prior(common, defaults)
     if runner == "ab3dmot":
         return [
             str(matrix.get("python", "python")),
@@ -231,6 +232,8 @@ def _tracking_params(matrix: dict[str, Any], dataset_id: str, method: dict[str, 
         "center_distance",
         "tlom_threshold",
         "dt_hypotheses",
+        "init_velocity_mode",
+        "init_speed_prior",
     }})
     return params
 
@@ -244,6 +247,13 @@ def _append_dt_hypotheses(command: list[str], params: dict[str, Any]) -> None:
     cleaned = [str(float(value)) for value in values if float(value) > 0]
     if cleaned:
         command.extend(["--dt_hypotheses", *cleaned])
+
+
+def _append_motion_prior(command: list[str], params: dict[str, Any]) -> None:
+    mode = str(params.get("init_velocity_mode", "zero"))
+    speed = float(params.get("init_speed_prior", 0.0))
+    if mode != "zero" or speed > 0:
+        command.extend(["--init_velocity_mode", mode, "--init_speed_prior", str(speed)])
 
 
 def _materialized_cfg(

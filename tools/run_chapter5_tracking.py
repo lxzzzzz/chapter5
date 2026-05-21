@@ -17,7 +17,7 @@ from generative_tracking.config import load_config, resolve_info_path
 from generative_tracking.evaluator import evaluate_tracking_json
 from generative_tracking.geometry import boxes_iou_3d_axis_aligned
 from generative_tracking.nova_data import DetectionFrame, filter_detection_frame, load_detection_cache
-from tools.run_ab3dmot_tracking import _normalize_dt_hypotheses, match_by_iou
+from tools.run_ab3dmot_tracking import _initial_velocity_from_box, _normalize_dt_hypotheses, match_by_iou
 
 try:
     from tqdm.auto import tqdm
@@ -81,6 +81,8 @@ class Chapter5Tracker:
         center_distance: float,
         tlom_threshold: float,
         dt_hypotheses: list[float] | None = None,
+        init_velocity_mode: str = "zero",
+        init_speed_prior: float = 0.0,
     ) -> None:
         if variant not in VARIANTS:
             raise ValueError(f"Unknown Chapter 5 tracking variant: {variant}")
@@ -94,6 +96,8 @@ class Chapter5Tracker:
         self.center_distance = float(center_distance)
         self.tlom_threshold = float(tlom_threshold)
         self.dt_hypotheses = _normalize_dt_hypotheses(dt_hypotheses)
+        self.init_velocity_mode = str(init_velocity_mode)
+        self.init_speed_prior = float(init_speed_prior)
         self.next_id = 0
         self.tracks: dict[int, TrackState] = {}
 
@@ -315,7 +319,11 @@ class Chapter5Tracker:
         self.tracks[track_id] = TrackState(
             track_id=track_id,
             box=box,
-            velocity=np.zeros((7,), dtype=np.float32),
+            velocity=_initial_velocity_from_box(
+                box,
+                mode=self.init_velocity_mode,
+                speed_prior=self.init_speed_prior,
+            ),
             score=float(det.pred_scores[det_idx]),
             class_id=int(det.pred_labels[det_idx]),
         )
@@ -398,6 +406,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_lost_frames", type=int, default=2)
     parser.add_argument("--min_hits", type=int, default=1)
     parser.add_argument("--dt_hypotheses", type=float, nargs="+", default=None)
+    parser.add_argument("--init_velocity_mode", choices=["zero", "heading_prior"], default="zero")
+    parser.add_argument("--init_speed_prior", type=float, default=0.0)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--progress_interval", type=int, default=50)
     parser.add_argument("--eval_metrics", action="store_true")
@@ -433,6 +443,8 @@ def main() -> None:
         max_lost_frames=int(args.max_lost_frames),
         min_hits=int(args.min_hits),
         dt_hypotheses=args.dt_hypotheses,
+        init_velocity_mode=str(args.init_velocity_mode),
+        init_speed_prior=float(args.init_speed_prior),
         max_frames=int(args.max_frames),
         progress_interval=max(1, int(args.progress_interval)),
     )
@@ -504,6 +516,8 @@ def run_tracking(
     max_lost_frames: int,
     min_hits: int,
     dt_hypotheses: list[float] | None,
+    init_velocity_mode: str,
+    init_speed_prior: float,
     max_frames: int,
     progress_interval: int,
 ) -> tuple[list[dict[str, Any]], Path]:
@@ -526,6 +540,8 @@ def run_tracking(
         center_distance=center_distance,
         tlom_threshold=tlom_threshold,
         dt_hypotheses=dt_hypotheses,
+        init_velocity_mode=init_velocity_mode,
+        init_speed_prior=init_speed_prior,
     )
     outputs: list[dict[str, Any]] = []
     current_sequence = None
