@@ -61,7 +61,7 @@ tracking_overrides:
   v2x_seq:
     eval_score_thresh: 0.6
     association_threshold: 0.001
-    max_lost_frames: 2
+    max_lost_frames: 6
     high_score_thresh: 0.6
     low_score_thresh: 0.3
   v2x_real:
@@ -71,7 +71,7 @@ tracking_overrides:
     high_score_thresh: 0.6
     low_score_thresh: 0.3
 
-tables6
+tables:
   table_5_4_association_ablation:
     title: "5.4 section association-stage ablation"
     datasets: [xian]
