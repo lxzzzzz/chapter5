@@ -28,8 +28,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "val": "/media/ana-4090/LY/chapter3/data/v2x_real/tracking_infos_val.pkl",
             },
             "v2x_seq": {
-                "train": "/media/ana-4090/LY/chapter3/data/v2x_xian/tracking_infos_train.pkl",
-                "val": "/media/ana-4090/LY/chapter3/data/v2x_xian/tracking_infos_val.pkl",
+                "train": "/home/lx/chapter3/data/v2x_seq/tracking_infos_train.pkl",
+                "val": "/home/lx/chapter3/data/v2x_seq/tracking_infos_val.pkl",
             },
         },
         "K": 3,
