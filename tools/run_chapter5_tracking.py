@@ -186,20 +186,25 @@ class Chapter5Tracker:
         self._age_unmatched(active_ids, [idx for idx in unmatched_track_pos if idx not in matched_track_pos], use_smooth_motion=use_smooth_motion, use_tlom=use_tlom)
 
     def _fmca_update(self, det: DetectionFrame) -> None:
+        initial_active_ids = sorted(self.tracks)
         confirmed = [tid for tid, trk in self.tracks.items() if trk.lost_frames == 0 and trk.hits >= self.min_hits]
-        short_lost = [tid for tid, trk in self.tracks.items() if 0 < trk.lost_frames <= max(1, self.max_lost_frames // 2)]
-        long_lost = [tid for tid, trk in self.tracks.items() if trk.lost_frames > max(1, self.max_lost_frames // 2)]
         high = _subset_detection(det, det.pred_scores >= self.high_score_thresh)
         low = _subset_detection(det, (det.pred_scores >= self.low_score_thresh) & (det.pred_scores < self.high_score_thresh))
 
         matched_ids: set[int] = set()
         used_high: set[int] = set()
         used_low: set[int] = set()
-        for group_ids, group_det, cost, threshold, used in (
+
+        # Full FMCA is a superset of the two-stage tracker: high-score fused
+        # association first, then center-based high/low recovery for tracks
+        # that remain unmatched.
+        stages = (
             (sorted(confirmed), high, "fused", None, used_high),
-            (sorted(short_lost), high, "center", 1e-6, used_high),
-            (sorted(long_lost), low, "center", 1e-6, used_low),
-        ):
+            (initial_active_ids, high, "center", 1e-6, used_high),
+            (initial_active_ids, low, "center", 1e-6, used_low),
+        )
+        for group_ids, group_det, cost, threshold, used in stages:
+            group_ids = [track_id for track_id in group_ids if track_id not in matched_ids and track_id in self.tracks]
             available_det, index_map = _remove_indices(group_det, used)
             if not group_ids or len(available_det.pred_boxes) == 0:
                 continue
@@ -219,9 +224,8 @@ class Chapter5Tracker:
         for det_idx, score in enumerate(high.pred_scores.tolist()):
             if det_idx not in used_high and score >= self.high_score_thresh:
                 self._start_track(high, det_idx)
-        active_ids = sorted(self.tracks)
-        unmatched_positions = [idx for idx, tid in enumerate(active_ids) if tid not in matched_ids]
-        self._age_unmatched(active_ids, unmatched_positions, use_smooth_motion=True, use_tlom=True)
+        unmatched_positions = [idx for idx, tid in enumerate(initial_active_ids) if tid not in matched_ids]
+        self._age_unmatched(initial_active_ids, unmatched_positions, use_smooth_motion=True, use_tlom=True)
 
     def _match(
         self,
