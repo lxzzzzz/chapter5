@@ -138,7 +138,7 @@ def _tracking_command(
 
     dataset_id = str(job["dataset_id"])
     dataset = matrix["datasets"][dataset_id]
-    defaults = matrix.get("tracking_defaults", {})
+    defaults = _tracking_params(matrix, dataset_id, method)
     metrics = matrix.get("metrics", {})
     cfg_file = _materialized_cfg(repo_root, output_root, matrix, dataset_id, require_detector_ckpt=False)
     cache_root = _resolve_path(repo_root, dataset["cache_root"])
@@ -157,7 +157,7 @@ def _tracking_command(
         "--output_dir",
         str(method_output),
         "--score_thresh",
-        str(defaults.get("score_thresh", 0.6)),
+        str(defaults.get("eval_score_thresh", defaults.get("score_thresh", 0.6))),
         "--max_dets_per_frame",
         str(matrix.get("unified_detector", {}).get("max_dets_per_frame", 100)),
         "--max_lost_frames",
@@ -176,7 +176,7 @@ def _tracking_command(
             "tools/run_ab3dmot_tracking.py",
             *common,
             "--iou_threshold",
-            str(defaults.get("ab3dmot_iou_threshold", 0.1)),
+            str(defaults.get("association_threshold", defaults.get("ab3dmot_iou_threshold", 0.1))),
         ]
     if runner == "hierarchical":
         return [
@@ -186,11 +186,11 @@ def _tracking_command(
             "--mode",
             str(method.get("mode", "stage1_stage2")),
             "--high_score_thresh",
-            str(defaults.get("high_score_thresh", defaults.get("score_thresh", 0.6))),
+            str(defaults.get("high_score_thresh", defaults.get("eval_score_thresh", defaults.get("score_thresh", 0.6)))),
             "--low_score_thresh",
             str(defaults.get("low_score_thresh", 0.3)),
             "--stage1_iou_threshold",
-            str(defaults.get("stage1_iou_threshold", 0.1)),
+            str(defaults.get("association_threshold", defaults.get("stage1_iou_threshold", 0.1))),
             "--stage2_center_distance",
             str(defaults.get("stage2_center_distance", 4.0)),
         ]
@@ -202,17 +202,35 @@ def _tracking_command(
             "--variant",
             str(method.get("variant", method_id)),
             "--high_score_thresh",
-            str(defaults.get("high_score_thresh", defaults.get("score_thresh", 0.6))),
+            str(defaults.get("high_score_thresh", defaults.get("eval_score_thresh", defaults.get("score_thresh", 0.6)))),
             "--low_score_thresh",
             str(defaults.get("low_score_thresh", 0.3)),
             "--iou_threshold",
-            str(defaults.get("stage1_iou_threshold", defaults.get("ab3dmot_iou_threshold", 0.1))),
+            str(defaults.get("association_threshold", defaults.get("stage1_iou_threshold", defaults.get("ab3dmot_iou_threshold", 0.1)))),
             "--center_distance",
             str(method.get("center_distance", defaults.get("center_distance", defaults.get("stage2_center_distance", 4.0)))),
             "--tlom_threshold",
             str(method.get("tlom_threshold", defaults.get("tlom_threshold", 0.5))),
         ]
     raise ValueError(f"Unknown runner {runner!r} for method {method_id!r}")
+
+
+def _tracking_params(matrix: dict[str, Any], dataset_id: str, method: dict[str, Any]) -> dict[str, Any]:
+    params: dict[str, Any] = dict(matrix.get("tracking_defaults", {}))
+    params.update(matrix.get("tracking_overrides", {}).get(dataset_id, {}))
+    params.update({key: value for key, value in method.items() if key in {
+        "eval_score_thresh",
+        "score_thresh",
+        "association_threshold",
+        "max_lost_frames",
+        "min_hits",
+        "high_score_thresh",
+        "low_score_thresh",
+        "stage2_center_distance",
+        "center_distance",
+        "tlom_threshold",
+    }})
+    return params
 
 
 def _materialized_cfg(

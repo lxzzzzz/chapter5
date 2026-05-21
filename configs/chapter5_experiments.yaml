@@ -41,18 +41,37 @@ metrics:
   columns: [sAMOTA, AMOTA, AMOTP, MOTA, MOTP, IDS, FRAG, FP, FN]
 
 tracking_defaults:
-  score_thresh: 0.6
+  eval_score_thresh: 0.6
+  association_threshold: 0.1
   max_lost_frames: 2
   min_hits: 1
-  ab3dmot_iou_threshold: 0.1
   high_score_thresh: 0.6
   low_score_thresh: 0.3
-  stage1_iou_threshold: 0.1
   stage2_center_distance: 4.0
   center_distance: 4.0
   tlom_threshold: 0.50
 
-tables:
+tracking_overrides:
+  xian:
+    eval_score_thresh: 0.6
+    association_threshold: 0.001
+    max_lost_frames: 2
+    high_score_thresh: 0.6
+    low_score_thresh: 0.3
+  v2x_seq:
+    eval_score_thresh: 0.6
+    association_threshold: 0.001
+    max_lost_frames: 2
+    high_score_thresh: 0.6
+    low_score_thresh: 0.3
+  v2x_real:
+    eval_score_thresh: 0.6
+    association_threshold: 0.001
+    max_lost_frames: 9
+    high_score_thresh: 0.6
+    low_score_thresh: 0.3
+
+tables6
   table_5_4_association_ablation:
     title: "5.4 section association-stage ablation"
     datasets: [xian]
