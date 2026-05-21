@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -168,6 +169,7 @@ def main() -> None:
     output_path = Path(args.output) if args.output else output_dir / f"ab3dmot_{args.split}_tracking_results.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    start_time = time.perf_counter()
     outputs, info_path = run_ab3dmot(
         cfg=cfg,
         split=str(args.split),
@@ -179,9 +181,16 @@ def main() -> None:
         max_frames=int(args.max_frames),
         progress_interval=max(1, int(args.progress_interval)),
     )
+    tracking_seconds = time.perf_counter() - start_time
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(outputs, f, indent=2)
     print(f"wrote {len(outputs)} frames to {output_path}", flush=True)
+    _write_runtime_summary(
+        output_dir / "runtime_summary.json",
+        method="ab3dmot",
+        frames=len(outputs),
+        tracking_seconds=tracking_seconds,
+    )
 
     eval_iou = float(args.eval_iou_threshold if args.eval_iou_threshold is not None else cfg.evaluator.iou_threshold)
     if args.eval_metrics or args.eval_ab3dmot:
@@ -280,6 +289,23 @@ def run_ab3dmot(
     if progress is not None:
         progress.close()
     return outputs, info_path
+
+
+def _write_runtime_summary(path: Path, *, method: str, frames: int, tracking_seconds: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fps = float(frames) / max(float(tracking_seconds), 1e-12)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "method": method,
+                "num_frames": int(frames),
+                "tracking_time_s": float(tracking_seconds),
+                "tracking_fps": fps,
+                "tracking_ms_per_frame": 1000.0 / max(fps, 1e-12),
+            },
+            f,
+            indent=2,
+        )
 
 
 def _filter_for_tracking(det: DetectionFrame, *, score_thresh: float, max_dets_per_frame: int) -> DetectionFrame:

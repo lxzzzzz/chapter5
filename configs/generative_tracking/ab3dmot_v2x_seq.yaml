@@ -1,6 +1,6 @@
 chapter3_root: /media/ana-4090/LY/chapter3
-detector_cfg_file: /media/ana-4090/LY/chapter3/tools/cfgs/exp46/4-10_A1_mths.yaml
-detector_ckpt: /media/ana-4090/LY/chapter3/output/cfgs/exp46/4-10_A1_mths/exp46/4-10/A1/ckpt/checkpoint_epoch_2.pth
+detector_cfg_file: /media/ana-4090/LY/chapter3/tools/cfgs/custom_models/voxelnext_v2x_seq_lidar.yaml
+detector_ckpt: /media/ana-4090/LY/chapter3/output/cfgs/custom_models/voxelnext_v2x_seq_lidar/default/ckpt/checkpoint_epoch_30.pth
 
 dataset:
   name: v2x_seq

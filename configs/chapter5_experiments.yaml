@@ -1,0 +1,186 @@
+chapter3_root: /media/ana-4090/LY/chapter3
+python: python
+
+unified_detector:
+  name: unified_voxelnext_4090
+  description: "Use the provided 4090 VoxelNeXt checkpoints as the unified detector input for every tracker in Chapter 5."
+  cache_score_thresh: 0.05
+  max_dets_per_frame: 100
+  detector_cfg_file:
+    xian: /media/ana-4090/LY/chapter3/tools/cfgs/dair_v2x_models/voxelnext_v2x_xian_lidar.yaml
+    v2x_seq: /media/ana-4090/LY/chapter3/tools/cfgs/custom_models/voxelnext_v2x_seq_lidar.yaml
+    v2x_real: /media/ana-4090/LY/chapter3/tools/cfgs/custom_models/voxelnext_v2x_real_lidar.yaml
+  detector_ckpt:
+    xian: /media/ana-4090/LY/chapter3/output/cfgs/dair_v2x_models/voxelnext_v2x_xian_lidar/default/ckpt/checkpoint_epoch_10.pth
+    v2x_seq: /media/ana-4090/LY/chapter3/output/cfgs/custom_models/voxelnext_v2x_seq_lidar/default/ckpt/checkpoint_epoch_30.pth
+    v2x_real: /media/ana-4090/LY/chapter3/output/cfgs/custom_models/voxelnext_v2x_real_lidar/default/ckpt/checkpoint_epoch_10.pth
+
+datasets:
+  xian:
+    paper_name: MTHS-SEU
+    cfg_file: configs/generative_tracking/ab3dmot_xian.yaml
+    split: val
+    cache_root: outputs/chapter5/unified_detector/xian/detection_cache
+    table_scope: [ablation, comparison, runtime, visualization]
+  v2x_seq:
+    paper_name: DAIR-V2X roadside sequence
+    cfg_file: configs/generative_tracking/ab3dmot_v2x_seq.yaml
+    split: val
+    cache_root: outputs/chapter5/unified_detector/v2x_seq/detection_cache
+    table_scope: [comparison]
+  v2x_real:
+    paper_name: V2X-Real-I2I
+    cfg_file: configs/generative_tracking/ab3dmot_v2x_real.yaml
+    split: val
+    cache_root: outputs/chapter5/unified_detector/v2x_real/detection_cache
+    table_scope: [comparison]
+
+metrics:
+  eval_iou_threshold: 0.5
+  recall_points: 40
+  columns: [sAMOTA, AMOTA, AMOTP, MOTA, MOTP, IDS, FRAG, FP, FN]
+
+tracking_defaults:
+  score_thresh: 0.6
+  max_lost_frames: 2
+  min_hits: 1
+  ab3dmot_iou_threshold: 0.1
+  high_score_thresh: 0.6
+  low_score_thresh: 0.3
+  stage1_iou_threshold: 0.1
+  stage2_center_distance: 4.0
+  center_distance: 4.0
+  tlom_threshold: 0.50
+
+tables:
+  table_5_4_association_ablation:
+    title: "5.4 section association-stage ablation"
+    datasets: [xian]
+    methods:
+      - id: ab3dmot
+        paper_name: "AB3DMOT association baseline"
+        runner: ab3dmot
+      - id: stage1
+        paper_name: "Stage-1 association"
+        runner: hierarchical
+        mode: stage1
+      - id: stage1_stage2
+        paper_name: "Stage-1 + Stage-2 association"
+        runner: hierarchical
+        mode: stage1_stage2
+      - id: full_5_4
+        paper_name: "Full 5.4 tracker"
+        runner: chapter5
+        variant: full_5_4
+
+  table_5_5_core_ablation:
+    title: "5.5 section NEKFM/TLOM/FMCA core ablation"
+    datasets: [xian]
+    methods:
+      - id: baseline_motion
+        paper_name: "Baseline tracker"
+        runner: chapter5
+        variant: baseline_motion
+      - id: baseline_nekfm
+        paper_name: "Baseline + NEKFM"
+        runner: chapter5
+        variant: baseline_nekfm
+      - id: baseline_nekfm_tlom
+        paper_name: "Baseline + NEKFM + TLOM"
+        runner: chapter5
+        variant: baseline_nekfm_tlom
+      - id: full_5_5
+        paper_name: "Baseline + NEKFM + TLOM + FMCA"
+        runner: chapter5
+        variant: full_5_5
+
+  table_5_5_fmca_ablation:
+    title: "FMCA association strategy ablation"
+    datasets: [xian]
+    methods:
+      - id: fmca_single_stage
+        paper_name: "Single-stage association"
+        runner: chapter5
+        variant: fmca_single_stage
+      - id: fmca_two_stage
+        paper_name: "Two-stage association"
+        runner: chapter5
+        variant: fmca_two_stage
+      - id: fmca_full
+        paper_name: "Full FMCA association"
+        runner: chapter5
+        variant: fmca_full
+
+  table_5_5_tlom_threshold:
+    title: "TLOM lifecycle threshold sensitivity"
+    datasets: [xian]
+    methods:
+      - id: tlom_tau_030
+        paper_name: "tau = 0.30"
+        runner: chapter5
+        variant: baseline_nekfm_tlom
+        tlom_threshold: 0.30
+      - id: tlom_tau_040
+        paper_name: "tau = 0.40"
+        runner: chapter5
+        variant: baseline_nekfm_tlom
+        tlom_threshold: 0.40
+      - id: tlom_tau_050
+        paper_name: "tau = 0.50"
+        runner: chapter5
+        variant: baseline_nekfm_tlom
+        tlom_threshold: 0.50
+      - id: tlom_tau_060
+        paper_name: "tau = 0.60"
+        runner: chapter5
+        variant: baseline_nekfm_tlom
+        tlom_threshold: 0.60
+      - id: tlom_tau_070
+        paper_name: "tau = 0.70"
+        runner: chapter5
+        variant: baseline_nekfm_tlom
+        tlom_threshold: 0.70
+
+  table_5_comparison:
+    title: "Three-dataset 3D MOT comparison"
+    datasets: [xian, v2x_seq, v2x_real]
+    methods:
+      - id: ab3dmot
+        paper_name: "AB3DMOT"
+        runner: ab3dmot
+      - id: centerpoint_track
+        paper_name: "CenterPoint-Track"
+        runner: chapter5
+        variant: centerpoint_track
+      - id: simpletrack
+        paper_name: "SimpleTrack"
+        runner: chapter5
+        variant: simpletrack
+      - id: eagermot
+        paper_name: "EagerMOT"
+        runner: chapter5
+        variant: eagermot
+      - id: full_5_4
+        paper_name: "5.4 section tracker"
+        runner: chapter5
+        variant: full_5_4
+      - id: full_5_5
+        paper_name: "5.5 section tracker"
+        runner: chapter5
+        variant: full_5_5
+
+  table_5_runtime:
+    title: "Runtime and complexity"
+    datasets: [xian]
+    methods:
+      - id: ab3dmot
+        paper_name: "Baseline / AB3DMOT"
+        runner: ab3dmot
+      - id: full_5_4
+        paper_name: "5.4 section tracker"
+        runner: chapter5
+        variant: full_5_4
+      - id: full_5_5
+        paper_name: "5.5 section tracker"
+        runner: chapter5
+        variant: full_5_5
