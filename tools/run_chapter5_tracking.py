@@ -17,7 +17,7 @@ from generative_tracking.config import load_config, resolve_info_path
 from generative_tracking.evaluator import evaluate_tracking_json
 from generative_tracking.geometry import boxes_iou_3d_axis_aligned
 from generative_tracking.nova_data import DetectionFrame, filter_detection_frame, load_detection_cache
-from tools.run_ab3dmot_tracking import match_by_iou
+from tools.run_ab3dmot_tracking import _normalize_dt_hypotheses, match_by_iou
 
 try:
     from tqdm.auto import tqdm
@@ -80,6 +80,7 @@ class Chapter5Tracker:
         iou_threshold: float,
         center_distance: float,
         tlom_threshold: float,
+        dt_hypotheses: list[float] | None = None,
     ) -> None:
         if variant not in VARIANTS:
             raise ValueError(f"Unknown Chapter 5 tracking variant: {variant}")
@@ -92,6 +93,7 @@ class Chapter5Tracker:
         self.iou_threshold = float(iou_threshold)
         self.center_distance = float(center_distance)
         self.tlom_threshold = float(tlom_threshold)
+        self.dt_hypotheses = _normalize_dt_hypotheses(dt_hypotheses)
         self.next_id = 0
         self.tracks: dict[int, TrackState] = {}
 
@@ -149,18 +151,18 @@ class Chapter5Tracker:
         active_ids = sorted(self.tracks)
         matches, unmatched_track_pos, unmatched_high = self._match(active_ids, high, cost=cost, use_smooth_motion=use_smooth_motion)
         self._apply_matches(active_ids, high, matches, use_smooth_motion=use_smooth_motion)
-        matched_track_pos = {track_pos for track_pos, _det_idx, _score in matches}
+        matched_track_pos = {track_pos for track_pos, _det_idx, _score, _dt_scale in matches}
 
         if unmatched_track_pos and len(low.pred_boxes):
             low_track_ids = [active_ids[pos] for pos in unmatched_track_pos]
             low_matches, low_unmatched_local, _low_unmatched = self._match(low_track_ids, low, cost="center", threshold=1e-6, use_smooth_motion=use_smooth_motion)
             accepted_local: set[int] = set()
-            for local_track_pos, det_idx, score in low_matches:
+            for local_track_pos, det_idx, score, dt_scale in low_matches:
                 track_pos = unmatched_track_pos[local_track_pos]
                 track_id = active_ids[track_pos]
-                distance = float(np.linalg.norm(self._predicted_box(track_id, use_smooth_motion=use_smooth_motion)[:3] - low.pred_boxes[det_idx, :3]))
+                distance = self._best_center_distance(track_id, low.pred_boxes[det_idx], use_smooth_motion=use_smooth_motion)
                 if distance <= self.center_distance:
-                    self._update_track(track_id, low, det_idx, use_smooth_motion=use_smooth_motion)
+                    self._update_track(track_id, low, det_idx, use_smooth_motion=use_smooth_motion, dt_scale=dt_scale)
                     matched_track_pos.add(track_pos)
                     accepted_local.add(local_track_pos)
             unmatched_track_pos = sorted(
@@ -198,15 +200,15 @@ class Chapter5Tracker:
             if not group_ids or len(available_det.pred_boxes) == 0:
                 continue
             matches, _unmatched_tracks, _unmatched_dets = self._match(group_ids, available_det, cost=cost, threshold=threshold, use_smooth_motion=True)
-            for track_pos, det_idx, _score in matches:
+            for track_pos, det_idx, _score, dt_scale in matches:
                 track_id = group_ids[track_pos]
                 if track_id in matched_ids:
                     continue
-                distance = float(np.linalg.norm(self._predicted_box(track_id, use_smooth_motion=True)[:3] - available_det.pred_boxes[det_idx, :3]))
+                distance = self._best_center_distance(track_id, available_det.pred_boxes[det_idx], use_smooth_motion=True)
                 if cost == "center" and distance > self.center_distance:
                     continue
                 original_idx = int(index_map[det_idx])
-                self._update_track(track_id, available_det, det_idx, use_smooth_motion=True)
+                self._update_track(track_id, available_det, det_idx, use_smooth_motion=True, dt_scale=dt_scale)
                 matched_ids.add(track_id)
                 used.add(original_idx)
 
@@ -225,35 +227,67 @@ class Chapter5Tracker:
         cost: str,
         threshold: float | None = None,
         use_smooth_motion: bool = True,
-    ) -> tuple[list[tuple[int, int, float]], list[int], list[int]]:
+    ) -> tuple[list[tuple[int, int, float, float]], list[int], list[int]]:
         if not track_ids:
             return [], [], list(range(len(det.pred_boxes)))
         if len(det.pred_boxes) == 0:
             return [], list(range(len(track_ids))), []
-        pred_boxes = np.stack([self._predicted_box(track_id, use_smooth_motion=use_smooth_motion) for track_id in track_ids]).astype(np.float32)
-        if cost == "iou":
-            score = boxes_iou_3d_axis_aligned(pred_boxes, det.pred_boxes)
-            accept = self.iou_threshold if threshold is None else float(threshold)
-        elif cost == "center":
-            distance = _center_distance(pred_boxes, det.pred_boxes)
-            score = np.maximum(0.0, 1.0 - distance / max(self.center_distance, 1e-6)).astype(np.float32)
-            accept = 1e-6 if threshold is None else float(threshold)
-        elif cost == "fused":
-            iou = boxes_iou_3d_axis_aligned(pred_boxes, det.pred_boxes)
-            distance = _center_distance(pred_boxes, det.pred_boxes)
-            center_score = np.maximum(0.0, 1.0 - distance / max(self.center_distance, 1e-6)).astype(np.float32)
-            score = (0.55 * iou + 0.45 * center_score).astype(np.float32)
-            accept = 0.05 if threshold is None else float(threshold)
-        else:
-            raise ValueError(f"Unknown cost type: {cost}")
-        for row, track_id in enumerate(track_ids):
-            track_cls = int(self.tracks[track_id].class_id)
-            score[row, det.pred_labels != track_cls] = 0.0
-        return match_by_iou(score, accept)
+        accept = self._accept_threshold(cost, threshold)
+        matches: list[tuple[int, int, float, float]] = []
+        matched_tracks: set[int] = set()
+        matched_dets: set[int] = set()
+        for dt_scale in self.dt_hypotheses:
+            remaining_track_pos = [idx for idx in range(len(track_ids)) if idx not in matched_tracks]
+            remaining_det_idx = [idx for idx in range(len(det.pred_boxes)) if idx not in matched_dets]
+            if not remaining_track_pos or not remaining_det_idx:
+                break
+            remaining_track_ids = [track_ids[pos] for pos in remaining_track_pos]
+            pred_boxes = np.stack(
+                [self._predicted_box(track_id, use_smooth_motion=use_smooth_motion, dt_scale=dt_scale) for track_id in remaining_track_ids]
+            ).astype(np.float32)
+            det_boxes = det.pred_boxes[remaining_det_idx]
+            score = self._association_score(pred_boxes, det_boxes, cost)
+            for row, track_id in enumerate(remaining_track_ids):
+                track_cls = int(self.tracks[track_id].class_id)
+                score[row, det.pred_labels[remaining_det_idx] != track_cls] = 0.0
+            local_matches, _local_unmatched_tracks, _local_unmatched_dets = match_by_iou(score, accept)
+            for local_track_pos, local_det_idx, match_score in local_matches:
+                track_pos = remaining_track_pos[local_track_pos]
+                det_idx = remaining_det_idx[local_det_idx]
+                matches.append((track_pos, det_idx, match_score, float(dt_scale)))
+                matched_tracks.add(track_pos)
+                matched_dets.add(det_idx)
+        unmatched_tracks = [idx for idx in range(len(track_ids)) if idx not in matched_tracks]
+        unmatched_dets = [idx for idx in range(len(det.pred_boxes)) if idx not in matched_dets]
+        return matches, unmatched_tracks, unmatched_dets
 
-    def _apply_matches(self, active_ids: list[int], det: DetectionFrame, matches: list[tuple[int, int, float]], *, use_smooth_motion: bool) -> None:
-        for track_pos, det_idx, _score in matches:
-            self._update_track(active_ids[track_pos], det, det_idx, use_smooth_motion=use_smooth_motion)
+    def _accept_threshold(self, cost: str, threshold: float | None) -> float:
+        if threshold is not None:
+            return float(threshold)
+        if cost == "iou":
+            return self.iou_threshold
+        if cost == "center":
+            return 1e-6
+        if cost == "fused":
+            return 0.05
+        raise ValueError(f"Unknown cost type: {cost}")
+
+    def _association_score(self, pred_boxes: np.ndarray, det_boxes: np.ndarray, cost: str) -> np.ndarray:
+        if cost == "iou":
+            return boxes_iou_3d_axis_aligned(pred_boxes, det_boxes)
+        if cost == "center":
+            distance = _center_distance(pred_boxes, det_boxes)
+            return np.maximum(0.0, 1.0 - distance / max(self.center_distance, 1e-6)).astype(np.float32)
+        if cost == "fused":
+            iou = boxes_iou_3d_axis_aligned(pred_boxes, det_boxes)
+            distance = _center_distance(pred_boxes, det_boxes)
+            center_score = np.maximum(0.0, 1.0 - distance / max(self.center_distance, 1e-6)).astype(np.float32)
+            return (0.55 * iou + 0.45 * center_score).astype(np.float32)
+        raise ValueError(f"Unknown cost type: {cost}")
+
+    def _apply_matches(self, active_ids: list[int], det: DetectionFrame, matches: list[tuple[int, int, float, float]], *, use_smooth_motion: bool) -> None:
+        for track_pos, det_idx, _score, dt_scale in matches:
+            self._update_track(active_ids[track_pos], det, det_idx, use_smooth_motion=use_smooth_motion, dt_scale=dt_scale)
 
     def _age_unmatched(self, active_ids: list[int], unmatched_track_pos: list[int], *, use_smooth_motion: bool, use_tlom: bool) -> None:
         for track_pos in unmatched_track_pos:
@@ -286,12 +320,12 @@ class Chapter5Tracker:
             class_id=int(det.pred_labels[det_idx]),
         )
 
-    def _update_track(self, track_id: int, det: DetectionFrame, det_idx: int, *, use_smooth_motion: bool) -> None:
+    def _update_track(self, track_id: int, det: DetectionFrame, det_idx: int, *, use_smooth_motion: bool, dt_scale: float) -> None:
         track = self.tracks[track_id]
         new_box = det.pred_boxes[det_idx].astype(np.float32)
-        pred_box = self._predicted_box(track_id, use_smooth_motion=use_smooth_motion)
+        pred_box = self._predicted_box(track_id, use_smooth_motion=use_smooth_motion, dt_scale=dt_scale)
         residual = float(np.linalg.norm(new_box[:3] - pred_box[:3]))
-        raw_velocity = new_box - track.box
+        raw_velocity = (new_box - track.box) / max(float(dt_scale), 1e-6)
         if use_smooth_motion and track.history:
             track.velocity = 0.65 * track.velocity + 0.35 * raw_velocity
         else:
@@ -306,7 +340,7 @@ class Chapter5Tracker:
         track.residual_history.append(residual)
         track.reliability = min(1.0, 0.7 * track.reliability + 0.3 * float(det.pred_scores[det_idx]))
 
-    def _predicted_box(self, track_id: int, *, use_smooth_motion: bool) -> np.ndarray:
+    def _predicted_box(self, track_id: int, *, use_smooth_motion: bool, dt_scale: float = 1.0) -> np.ndarray:
         track = self.tracks[track_id]
         pred = track.box.astype(np.float32).copy()
         velocity = track.velocity.astype(np.float32)
@@ -316,9 +350,16 @@ class Chapter5Tracker:
             weights = np.linspace(0.5, 1.0, num=len(deltas), dtype=np.float32)
             smooth = np.average(np.stack(deltas), axis=0, weights=weights)
             velocity = 0.5 * velocity + 0.5 * smooth.astype(np.float32)
-        pred[:3] += velocity[:3]
-        pred[6] += velocity[6]
+        pred[:3] += velocity[:3] * float(dt_scale)
+        pred[6] += velocity[6] * float(dt_scale)
         return pred
+
+    def _best_center_distance(self, track_id: int, det_box: np.ndarray, *, use_smooth_motion: bool) -> float:
+        distances = [
+            float(np.linalg.norm(self._predicted_box(track_id, use_smooth_motion=use_smooth_motion, dt_scale=dt_scale)[:3] - det_box[:3]))
+            for dt_scale in self.dt_hypotheses
+        ]
+        return min(distances) if distances else float("inf")
 
     def _survival_probability(self, track: TrackState) -> float:
         residual = float(np.mean(track.residual_history)) if track.residual_history else 0.0
@@ -356,6 +397,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_iou_threshold", type=float, default=None)
     parser.add_argument("--max_lost_frames", type=int, default=2)
     parser.add_argument("--min_hits", type=int, default=1)
+    parser.add_argument("--dt_hypotheses", type=float, nargs="+", default=None)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--progress_interval", type=int, default=50)
     parser.add_argument("--eval_metrics", action="store_true")
@@ -390,6 +432,7 @@ def main() -> None:
         tlom_threshold=float(args.tlom_threshold),
         max_lost_frames=int(args.max_lost_frames),
         min_hits=int(args.min_hits),
+        dt_hypotheses=args.dt_hypotheses,
         max_frames=int(args.max_frames),
         progress_interval=max(1, int(args.progress_interval)),
     )
@@ -460,6 +503,7 @@ def run_tracking(
     tlom_threshold: float,
     max_lost_frames: int,
     min_hits: int,
+    dt_hypotheses: list[float] | None,
     max_frames: int,
     progress_interval: int,
 ) -> tuple[list[dict[str, Any]], Path]:
@@ -481,6 +525,7 @@ def run_tracking(
         iou_threshold=iou_threshold,
         center_distance=center_distance,
         tlom_threshold=tlom_threshold,
+        dt_hypotheses=dt_hypotheses,
     )
     outputs: list[dict[str, Any]] = []
     current_sequence = None

@@ -170,6 +170,7 @@ def _tracking_command(
         str(metrics.get("recall_points", 40)),
         "--eval_ab3dmot",
     ]
+    _append_dt_hypotheses(common, defaults)
     if runner == "ab3dmot":
         return [
             str(matrix.get("python", "python")),
@@ -229,8 +230,20 @@ def _tracking_params(matrix: dict[str, Any], dataset_id: str, method: dict[str, 
         "stage2_center_distance",
         "center_distance",
         "tlom_threshold",
+        "dt_hypotheses",
     }})
     return params
+
+
+def _append_dt_hypotheses(command: list[str], params: dict[str, Any]) -> None:
+    values = params.get("dt_hypotheses")
+    if values is None:
+        return
+    if not isinstance(values, (list, tuple)):
+        values = [values]
+    cleaned = [str(float(value)) for value in values if float(value) > 0]
+    if cleaned:
+        command.extend(["--dt_hypotheses", *cleaned])
 
 
 def _materialized_cfg(

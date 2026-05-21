@@ -16,7 +16,7 @@ from generative_tracking.config import load_config, resolve_info_path
 from generative_tracking.evaluator import evaluate_tracking_json
 from generative_tracking.geometry import boxes_iou_3d_axis_aligned
 from generative_tracking.nova_data import DetectionFrame, filter_detection_frame, load_detection_cache
-from tools.run_ab3dmot_tracking import AB3DTrack, match_by_iou
+from tools.run_ab3dmot_tracking import AB3DTrack, _normalize_dt_hypotheses, match_by_iou
 
 try:
     from tqdm.auto import tqdm
@@ -41,6 +41,7 @@ class HierarchicalTracker:
         stage2_center_distance: float,
         max_lost_frames: int,
         min_hits: int,
+        dt_hypotheses: list[float] | None = None,
     ) -> None:
         if mode not in {"stage1", "stage1_stage2"}:
             raise ValueError(f"Unsupported hierarchical mode: {mode}")
@@ -50,6 +51,7 @@ class HierarchicalTracker:
         self.stage2_center_distance = float(stage2_center_distance)
         self.max_lost_frames = int(max_lost_frames)
         self.min_hits = int(min_hits)
+        self.dt_hypotheses = _normalize_dt_hypotheses(dt_hypotheses)
         self.next_id = 0
         self.tracks: dict[int, AB3DTrack] = {}
 
@@ -65,17 +67,17 @@ class HierarchicalTracker:
         stage1_matches, unmatched_track_pos, unmatched_high = self._match_high(active_ids, high.frame)
         matched_track_pos: set[int] = set()
 
-        for track_pos, det_idx, _score in stage1_matches:
+        for track_pos, det_idx, _score, dt_scale in stage1_matches:
             track_id = active_ids[track_pos]
-            self._update_track(track_id, high.frame, det_idx)
+            self._update_track(track_id, high.frame, det_idx, dt_scale=dt_scale)
             matched_track_pos.add(track_pos)
 
         if self.mode == "stage1_stage2" and unmatched_track_pos and len(low.frame.pred_boxes):
             stage2_matches, still_unmatched_tracks = self._match_low(active_ids, unmatched_track_pos, low.frame)
             unmatched_track_pos = still_unmatched_tracks
-            for track_pos, det_idx, _score in stage2_matches:
+            for track_pos, det_idx, _score, dt_scale in stage2_matches:
                 track_id = active_ids[track_pos]
-                self._update_track(track_id, low.frame, det_idx)
+                self._update_track(track_id, low.frame, det_idx, dt_scale=dt_scale)
                 matched_track_pos.add(track_pos)
 
         for det_idx in unmatched_high:
@@ -98,34 +100,70 @@ class HierarchicalTracker:
         outputs.sort(key=lambda item: int(item["id"]))
         return {"sequence_id": det.sequence_id, "frame_id": det.frame_id, "tracks": outputs}
 
-    def _match_high(self, active_ids: list[int], det: DetectionFrame) -> tuple[list[tuple[int, int, float]], list[int], list[int]]:
-        pred_boxes = _predicted_boxes(self.tracks, active_ids)
-        iou = boxes_iou_3d_axis_aligned(pred_boxes, det.pred_boxes)
-        _mask_class_mismatch(iou, self.tracks, active_ids, det.pred_labels)
-        return match_by_iou(iou, self.stage1_iou_threshold)
+    def _match_high(self, active_ids: list[int], det: DetectionFrame) -> tuple[list[tuple[int, int, float, float]], list[int], list[int]]:
+        if not active_ids:
+            return [], [], list(range(len(det.pred_boxes)))
+        if len(det.pred_boxes) == 0:
+            return [], list(range(len(active_ids))), []
+        matches: list[tuple[int, int, float, float]] = []
+        matched_tracks: set[int] = set()
+        matched_dets: set[int] = set()
+        for dt_scale in self.dt_hypotheses:
+            remaining_track_pos = [idx for idx in range(len(active_ids)) if idx not in matched_tracks]
+            remaining_det_idx = [idx for idx in range(len(det.pred_boxes)) if idx not in matched_dets]
+            if not remaining_track_pos or not remaining_det_idx:
+                break
+            track_ids = [active_ids[pos] for pos in remaining_track_pos]
+            pred_boxes = _predicted_boxes(self.tracks, track_ids, dt_scale=dt_scale)
+            iou = boxes_iou_3d_axis_aligned(pred_boxes, det.pred_boxes[remaining_det_idx])
+            _mask_class_mismatch(iou, self.tracks, track_ids, det.pred_labels[remaining_det_idx])
+            local_matches, _unmatched_tracks, _unmatched_dets = match_by_iou(iou, self.stage1_iou_threshold)
+            for local_track_pos, local_det_idx, score in local_matches:
+                track_pos = remaining_track_pos[local_track_pos]
+                det_idx = remaining_det_idx[local_det_idx]
+                matches.append((track_pos, det_idx, score, float(dt_scale)))
+                matched_tracks.add(track_pos)
+                matched_dets.add(det_idx)
+        unmatched_tracks = [idx for idx in range(len(active_ids)) if idx not in matched_tracks]
+        unmatched_dets = [idx for idx in range(len(det.pred_boxes)) if idx not in matched_dets]
+        return matches, unmatched_tracks, unmatched_dets
 
     def _match_low(
         self,
         active_ids: list[int],
         unmatched_track_pos: list[int],
         det: DetectionFrame,
-    ) -> tuple[list[tuple[int, int, float]], list[int]]:
+    ) -> tuple[list[tuple[int, int, float, float]], list[int]]:
         if not unmatched_track_pos or len(det.pred_boxes) == 0:
             return [], unmatched_track_pos
-        track_ids = [active_ids[pos] for pos in unmatched_track_pos]
-        pred_boxes = _predicted_boxes(self.tracks, track_ids)
-        distance = _center_distance(pred_boxes, det.pred_boxes)
-        score = np.maximum(0.0, 1.0 - distance / max(self.stage2_center_distance, 1e-6)).astype(np.float32)
-        _mask_class_mismatch(score, self.tracks, track_ids, det.pred_labels)
-        matches, unmatched_local_tracks, _unmatched_dets = match_by_iou(score, 1e-6)
+        matches: list[tuple[int, int, float, float]] = []
+        matched_tracks: set[int] = set()
+        matched_dets: set[int] = set()
+        distance_by_match: dict[tuple[int, int], float] = {}
+        for dt_scale in self.dt_hypotheses:
+            remaining_local_pos = [idx for idx in range(len(unmatched_track_pos)) if idx not in matched_tracks]
+            remaining_det_idx = [idx for idx in range(len(det.pred_boxes)) if idx not in matched_dets]
+            if not remaining_local_pos or not remaining_det_idx:
+                break
+            track_ids = [active_ids[unmatched_track_pos[pos]] for pos in remaining_local_pos]
+            pred_boxes = _predicted_boxes(self.tracks, track_ids, dt_scale=dt_scale)
+            distance = _center_distance(pred_boxes, det.pred_boxes[remaining_det_idx])
+            score = np.maximum(0.0, 1.0 - distance / max(self.stage2_center_distance, 1e-6)).astype(np.float32)
+            _mask_class_mismatch(score, self.tracks, track_ids, det.pred_labels[remaining_det_idx])
+            local_matches, _unmatched_tracks, _unmatched_dets = match_by_iou(score, 1e-6)
+            for row, col, match_score in local_matches:
+                local_track_pos = remaining_local_pos[row]
+                det_idx = remaining_det_idx[col]
+                matches.append((local_track_pos, det_idx, match_score, float(dt_scale)))
+                matched_tracks.add(local_track_pos)
+                matched_dets.add(det_idx)
+                distance_by_match[(local_track_pos, det_idx)] = float(distance[row, col])
         accepted = []
-        for local_track_pos, det_idx, match_score in matches:
-            if distance[local_track_pos, det_idx] <= self.stage2_center_distance:
-                accepted.append((unmatched_track_pos[local_track_pos], det_idx, match_score))
-        accepted_local = {local_track_pos for local_track_pos, det_idx, _score in matches if distance[local_track_pos, det_idx] <= self.stage2_center_distance}
-        still_unmatched = [unmatched_track_pos[idx] for idx in unmatched_local_tracks if idx not in accepted_local]
-        still_unmatched.extend(unmatched_track_pos[idx] for idx in range(len(unmatched_track_pos)) if idx not in accepted_local and idx not in unmatched_local_tracks)
-        still_unmatched = sorted(set(still_unmatched))
+        for local_track_pos, det_idx, match_score, dt_scale in matches:
+            if distance_by_match.get((local_track_pos, det_idx), float("inf")) <= self.stage2_center_distance:
+                accepted.append((unmatched_track_pos[local_track_pos], det_idx, match_score, dt_scale))
+        accepted_local = {local_track_pos for local_track_pos, det_idx, _score, _dt_scale in matches if distance_by_match.get((local_track_pos, det_idx), float("inf")) <= self.stage2_center_distance}
+        still_unmatched = [unmatched_track_pos[idx] for idx in range(len(unmatched_track_pos)) if idx not in accepted_local]
         return accepted, still_unmatched
 
     def _start_track(self, det: DetectionFrame, det_idx: int) -> None:
@@ -139,10 +177,10 @@ class HierarchicalTracker:
             class_id=int(det.pred_labels[det_idx]),
         )
 
-    def _update_track(self, track_id: int, det: DetectionFrame, det_idx: int) -> None:
+    def _update_track(self, track_id: int, det: DetectionFrame, det_idx: int, *, dt_scale: float) -> None:
         track = self.tracks[track_id]
         new_box = det.pred_boxes[det_idx].astype(np.float32)
-        track.velocity = new_box - track.box
+        track.velocity = (new_box - track.box) / max(float(dt_scale), 1e-6)
         track.box = new_box
         track.score = float(det.pred_scores[det_idx])
         track.class_id = int(det.pred_labels[det_idx])
@@ -178,6 +216,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_iou_threshold", type=float, default=None)
     parser.add_argument("--max_lost_frames", type=int, default=2)
     parser.add_argument("--min_hits", type=int, default=1)
+    parser.add_argument("--dt_hypotheses", type=float, nargs="+", default=None)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--progress_interval", type=int, default=50)
     parser.add_argument("--eval_metrics", action="store_true")
@@ -211,6 +250,7 @@ def main() -> None:
         stage2_center_distance=float(args.stage2_center_distance),
         max_lost_frames=int(args.max_lost_frames),
         min_hits=int(args.min_hits),
+        dt_hypotheses=args.dt_hypotheses,
         max_frames=int(args.max_frames),
         progress_interval=max(1, int(args.progress_interval)),
     )
@@ -280,6 +320,7 @@ def run_hierarchical(
     stage2_center_distance: float,
     max_lost_frames: int,
     min_hits: int,
+    dt_hypotheses: list[float] | None,
     max_frames: int,
     progress_interval: int,
 ) -> tuple[list[dict[str, Any]], Path]:
@@ -298,6 +339,7 @@ def run_hierarchical(
         stage2_center_distance=stage2_center_distance,
         max_lost_frames=max_lost_frames,
         min_hits=min_hits,
+        dt_hypotheses=dt_hypotheses,
     )
     outputs: list[dict[str, Any]] = []
     current_sequence = None
@@ -368,10 +410,10 @@ def _subset_detection(det: DetectionFrame, mask: np.ndarray) -> DetectionSubset:
     )
 
 
-def _predicted_boxes(tracks: dict[int, AB3DTrack], track_ids: list[int]) -> np.ndarray:
+def _predicted_boxes(tracks: dict[int, AB3DTrack], track_ids: list[int], *, dt_scale: float = 1.0) -> np.ndarray:
     if not track_ids:
         return np.zeros((0, 7), dtype=np.float32)
-    return np.stack([tracks[tid].predicted_box() for tid in track_ids]).astype(np.float32)
+    return np.stack([tracks[tid].predicted_box(dt_scale=dt_scale) for tid in track_ids]).astype(np.float32)
 
 
 def _mask_class_mismatch(scores: np.ndarray, tracks: dict[int, AB3DTrack], track_ids: list[int], pred_labels: np.ndarray) -> None:

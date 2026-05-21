@@ -34,10 +34,10 @@ class AB3DTrack:
     age: int = 1
     hits: int = 1
 
-    def predicted_box(self) -> np.ndarray:
+    def predicted_box(self, dt_scale: float = 1.0) -> np.ndarray:
         pred = np.asarray(self.box, dtype=np.float32).copy()
-        pred[:3] += self.velocity[:3]
-        pred[6] += self.velocity[6]
+        pred[:3] += self.velocity[:3] * float(dt_scale)
+        pred[6] += self.velocity[6] * float(dt_scale)
         return pred
 
 
@@ -51,11 +51,13 @@ class SimpleAB3DMOT:
         iou_threshold: float,
         max_lost_frames: int,
         min_hits: int,
+        dt_hypotheses: list[float] | None = None,
     ) -> None:
         self.class_names = class_names
         self.iou_threshold = float(iou_threshold)
         self.max_lost_frames = int(max_lost_frames)
         self.min_hits = int(min_hits)
+        self.dt_hypotheses = _normalize_dt_hypotheses(dt_hypotheses)
         self.next_id = 0
         self.tracks: dict[int, AB3DTrack] = {}
 
@@ -65,22 +67,16 @@ class SimpleAB3DMOT:
 
     def update(self, det: DetectionFrame) -> dict[str, Any]:
         active_ids = sorted(self.tracks)
-        pred_boxes = np.stack([self.tracks[tid].predicted_box() for tid in active_ids]).astype(np.float32) if active_ids else np.zeros((0, 7), dtype=np.float32)
-        iou = boxes_iou_3d_axis_aligned(pred_boxes, det.pred_boxes)
-        if iou.size:
-            for row, track_id in enumerate(active_ids):
-                track_cls = int(self.tracks[track_id].class_id)
-                iou[row, det.pred_labels != track_cls] = 0.0
-        matches, unmatched_tracks, unmatched_dets = match_by_iou(iou, self.iou_threshold)
+        matches, unmatched_tracks, unmatched_dets = self._match_with_dt(active_ids, det)
 
-        for track_pos, det_idx, _score in matches:
+        for track_pos, det_idx, _score, dt_scale in matches:
             track_id = active_ids[track_pos]
-            self._update_track(track_id, det, det_idx)
+            self._update_track(track_id, det, det_idx, dt_scale=dt_scale)
 
         for det_idx in unmatched_dets:
             self._start_track(det, det_idx)
 
-        matched_track_pos = {track_pos for track_pos, _det_idx, _score in matches}
+        matched_track_pos = {track_pos for track_pos, _det_idx, _score, _dt_scale in matches}
         for track_pos in unmatched_tracks:
             if track_pos in matched_track_pos or track_pos >= len(active_ids):
                 continue
@@ -98,6 +94,41 @@ class SimpleAB3DMOT:
         outputs.sort(key=lambda item: int(item["id"]))
         return {"sequence_id": det.sequence_id, "frame_id": det.frame_id, "tracks": outputs}
 
+    def _match_with_dt(self, active_ids: list[int], det: DetectionFrame) -> tuple[list[tuple[int, int, float, float]], list[int], list[int]]:
+        if not active_ids:
+            return [], [], list(range(len(det.pred_boxes)))
+        if len(det.pred_boxes) == 0:
+            return [], list(range(len(active_ids))), []
+        matches: list[tuple[int, int, float, float]] = []
+        matched_tracks: set[int] = set()
+        matched_dets: set[int] = set()
+        for dt_scale in self.dt_hypotheses:
+            remaining_track_pos = [idx for idx in range(len(active_ids)) if idx not in matched_tracks]
+            remaining_det_idx = [idx for idx in range(len(det.pred_boxes)) if idx not in matched_dets]
+            if not remaining_track_pos or not remaining_det_idx:
+                break
+            pred_boxes = np.stack(
+                [self.tracks[active_ids[pos]].predicted_box(dt_scale=dt_scale) for pos in remaining_track_pos]
+            ).astype(np.float32)
+            det_boxes = det.pred_boxes[remaining_det_idx]
+            iou = boxes_iou_3d_axis_aligned(pred_boxes, det_boxes)
+            if iou.size:
+                for row, track_pos in enumerate(remaining_track_pos):
+                    track_cls = int(self.tracks[active_ids[track_pos]].class_id)
+                    iou[row, det.pred_labels[remaining_det_idx] != track_cls] = 0.0
+            local_matches, _local_unmatched_tracks, _local_unmatched_dets = match_by_iou(iou, self.iou_threshold)
+            for local_track_pos, local_det_idx, score in local_matches:
+                track_pos = remaining_track_pos[local_track_pos]
+                det_idx = remaining_det_idx[local_det_idx]
+                if track_pos in matched_tracks or det_idx in matched_dets:
+                    continue
+                matches.append((track_pos, det_idx, score, float(dt_scale)))
+                matched_tracks.add(track_pos)
+                matched_dets.add(det_idx)
+        unmatched_tracks = [idx for idx in range(len(active_ids)) if idx not in matched_tracks]
+        unmatched_dets = [idx for idx in range(len(det.pred_boxes)) if idx not in matched_dets]
+        return matches, unmatched_tracks, unmatched_dets
+
     def _start_track(self, det: DetectionFrame, det_idx: int) -> None:
         track_id = self.next_id
         self.next_id += 1
@@ -109,10 +140,10 @@ class SimpleAB3DMOT:
             class_id=int(det.pred_labels[det_idx]),
         )
 
-    def _update_track(self, track_id: int, det: DetectionFrame, det_idx: int) -> None:
+    def _update_track(self, track_id: int, det: DetectionFrame, det_idx: int, *, dt_scale: float) -> None:
         track = self.tracks[track_id]
         new_box = det.pred_boxes[det_idx].astype(np.float32)
-        track.velocity = new_box - track.box
+        track.velocity = (new_box - track.box) / max(float(dt_scale), 1e-6)
         track.box = new_box
         track.score = float(det.pred_scores[det_idx])
         track.class_id = int(det.pred_labels[det_idx])
@@ -145,6 +176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_iou_threshold", type=float, default=None, help="3D IoU threshold for metric matching.")
     parser.add_argument("--max_lost_frames", type=int, default=2)
     parser.add_argument("--min_hits", type=int, default=1)
+    parser.add_argument("--dt_hypotheses", type=float, nargs="+", default=None)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--progress_interval", type=int, default=50)
     parser.add_argument("--eval_metrics", action="store_true")
@@ -178,6 +210,7 @@ def main() -> None:
         iou_threshold=float(args.iou_threshold),
         max_lost_frames=int(args.max_lost_frames),
         min_hits=int(args.min_hits),
+        dt_hypotheses=args.dt_hypotheses,
         max_frames=int(args.max_frames),
         progress_interval=max(1, int(args.progress_interval)),
     )
@@ -243,6 +276,7 @@ def run_ab3dmot(
     iou_threshold: float,
     max_lost_frames: int,
     min_hits: int,
+    dt_hypotheses: list[float] | None,
     max_frames: int,
     progress_interval: int,
 ) -> tuple[list[dict[str, Any]], Path]:
@@ -259,6 +293,7 @@ def run_ab3dmot(
         iou_threshold=iou_threshold,
         max_lost_frames=max_lost_frames,
         min_hits=min_hits,
+        dt_hypotheses=dt_hypotheses,
     )
     outputs: list[dict[str, Any]] = []
     current_sequence = None
@@ -369,6 +404,24 @@ def _greedy_match(scores: np.ndarray) -> list[tuple[int, int, float]]:
         used_dets.add(det_idx)
         matches.append((track_idx, det_idx, float(scores[track_idx, det_idx])))
     return matches
+
+
+def _normalize_dt_hypotheses(dt_hypotheses: list[float] | None) -> list[float]:
+    if dt_hypotheses is None:
+        dt_hypotheses = [1.0]
+    normalized: list[float] = []
+    for raw in dt_hypotheses:
+        value = float(raw)
+        if value <= 0:
+            continue
+        if not any(abs(value - existing) < 1e-6 for existing in normalized):
+            normalized.append(value)
+    if not normalized:
+        normalized = [1.0]
+    if not any(abs(1.0 - existing) < 1e-6 for existing in normalized):
+        normalized.insert(0, 1.0)
+    normalized.sort(key=lambda value: (abs(value - 1.0) > 1e-6, value))
+    return normalized
 
 
 if __name__ == "__main__":

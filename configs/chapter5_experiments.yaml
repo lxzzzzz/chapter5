@@ -50,6 +50,7 @@ tracking_defaults:
   stage2_center_distance: 4.0
   center_distance: 4.0
   tlom_threshold: 0.50
+  dt_hypotheses: [1.0]
 
 tracking_overrides:
   xian:
@@ -58,6 +59,7 @@ tracking_overrides:
     max_lost_frames: 2
     high_score_thresh: 0.6
     low_score_thresh: 0.3
+    dt_hypotheses: [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.5, 2.0, 2.5, 3.0]
   v2x_seq:
     eval_score_thresh: 0.6
     association_threshold: 0.001
