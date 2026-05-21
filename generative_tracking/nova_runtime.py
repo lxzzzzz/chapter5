@@ -98,10 +98,7 @@ class NOVAOnlineTracker:
                     }
                 )
                 rows.append(row)
-        batch = _runtime_collate(rows, self.device)
-        with torch.inference_mode():
-            out = model(batch)
-        scores = out["match_prob"].detach().float().cpu().numpy()
+        scores = _runtime_predict_match_prob(rows, self.device, model, _runtime_batch_size(self.cfg))
         return scores.reshape(len(active_ids), len(det.pred_boxes)).astype(np.float32)
 
     def _history_tensors(self, track_id: int) -> dict[str, np.ndarray]:
@@ -225,10 +222,7 @@ class NOVALifecycleOnlineTracker(NOVAOnlineTracker):
                 }
             )
             rows.append(row)
-        batch = _runtime_collate(rows, self.device)
-        with torch.inference_mode():
-            out = model(batch)
-        logits = out.get("action_logits", out.get("match_logits"))
+        logits = _runtime_predict_action_logits(rows, self.device, model, _runtime_batch_size(self.cfg))
         decisions = logits.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
         return {int(det_idx): bool(decisions[pos] == 1) for pos, det_idx in enumerate(unmatched_dets)}
 
@@ -267,10 +261,7 @@ class NOVALifecycleOnlineTracker(NOVAOnlineTracker):
                 }
             )
             rows.append(row)
-        batch = _runtime_collate(rows, self.device)
-        with torch.inference_mode():
-            out = model(batch)
-        logits = out.get("action_logits", out.get("match_logits"))
+        logits = _runtime_predict_action_logits(rows, self.device, model, _runtime_batch_size(self.cfg))
         decisions = logits.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
         return {int(track_id): bool(decisions[pos] == 1) for pos, track_id in enumerate(ordered_track_ids)}
 
@@ -350,6 +341,45 @@ def _runtime_collate(rows: list[dict[str, Any]], device: torch.device) -> dict[s
         out["task_name"] = [str(row.get("task_name", "association")) for row in rows]
         out["candidate_mask"] = torch.as_tensor([bool(row.get("candidate_mask", True)) for row in rows], dtype=torch.bool, device=device)
     return out
+
+
+def _runtime_batch_size(cfg: Config) -> int:
+    return max(1, int(cfg.nova.get("runtime_batch_size", 32)))
+
+
+def _runtime_row_chunks(rows: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
+    return [rows[start : start + batch_size] for start in range(0, len(rows), batch_size)]
+
+
+def _runtime_predict_match_prob(
+    rows: list[dict[str, Any]],
+    device: torch.device,
+    model: torch.nn.Module,
+    batch_size: int,
+) -> np.ndarray:
+    chunks: list[np.ndarray] = []
+    with torch.inference_mode():
+        for chunk in _runtime_row_chunks(rows, batch_size):
+            batch = _runtime_collate(chunk, device)
+            out = model(batch)
+            chunks.append(out["match_prob"].detach().float().cpu().numpy())
+    return np.concatenate(chunks, axis=0) if chunks else np.zeros((0,), dtype=np.float32)
+
+
+def _runtime_predict_action_logits(
+    rows: list[dict[str, Any]],
+    device: torch.device,
+    model: torch.nn.Module,
+    batch_size: int,
+) -> torch.Tensor:
+    chunks: list[torch.Tensor] = []
+    with torch.inference_mode():
+        for chunk in _runtime_row_chunks(rows, batch_size):
+            batch = _runtime_collate(chunk, device)
+            out = model(batch)
+            logits = out.get("action_logits", out.get("match_logits"))
+            chunks.append(logits.detach().cpu())
+    return torch.cat(chunks, dim=0) if chunks else torch.empty((0, 2), dtype=torch.float32)
 
 
 def run_nova_tracking(

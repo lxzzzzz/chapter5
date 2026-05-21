@@ -108,6 +108,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "det_gt_iou_threshold": 0.5,
         "association_threshold": 0.5,
         "max_lost_frames": 2,
+        "runtime_batch_size": 32,
         "geometry_hidden_size": 128,
         "negative_positive_ratio": 3.0,
         "box_token": "<box>",

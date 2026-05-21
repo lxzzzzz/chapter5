@@ -226,7 +226,7 @@ class NOVATest(unittest.TestCase):
         cfg = load_config(
             overrides={
                 "dataset": {"class_names": ["Car"]},
-                "nova": {"history_len": 2, "association_threshold": 0.5, "max_lost_frames": 1},
+                "nova": {"history_len": 2, "association_threshold": 0.5, "max_lost_frames": 1, "runtime_batch_size": 1},
             }
         )
         tracker = NOVAOnlineTracker(cfg, torch.device("cpu"))
@@ -288,6 +288,37 @@ class NOVATest(unittest.TestCase):
         self.assertEqual(out3["tracks"], [])
         self.assertEqual(tracker.tracks, {})
 
+    def test_runtime_association_uses_micro_batches(self):
+        cfg = load_config(
+            overrides={
+                "dataset": {"class_names": ["Car"]},
+                "nova": {"history_len": 2, "association_threshold": 0.5, "runtime_batch_size": 1},
+            }
+        )
+        tracker = NOVALifecycleOnlineTracker(cfg, torch.device("cpu"))
+        frame0 = DetectionFrame(
+            "seq0",
+            "000000",
+            0,
+            np.stack([_box(0.0), _box(10.0)]),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+            np.asarray([0, 0], dtype=np.int64),
+        )
+        tracker.update(frame0, _DummyLifecycleModel(assoc=[], birth=[1, 1], lifecycle=[]))
+
+        model = _DummyLifecycleModel(assoc=[0.9, 0.1, 0.2, 0.8], birth=[], lifecycle=[])
+        frame1 = DetectionFrame(
+            "seq0",
+            "000001",
+            1,
+            np.stack([_box(1.0), _box(11.0)]),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+            np.asarray([0, 0], dtype=np.int64),
+        )
+        out = tracker.update(frame1, model)
+        self.assertEqual([track["id"] for track in out["tracks"]], [0, 1])
+        self.assertEqual(model.call_sizes, [1, 1, 1, 1])
+
 
 class _DummyScores(torch.nn.Module):
     def __init__(self, scores):
@@ -306,9 +337,11 @@ class _DummyLifecycleModel(torch.nn.Module):
             "birth": list(birth),
             "lifecycle": list(lifecycle),
         }
+        self.call_sizes = []
 
     def forward(self, batch):
         task_names = batch.get("task_name", ["association"] * batch["candidate_box"].shape[0])
+        self.call_sizes.append(len(task_names))
         logits = []
         probs = []
         for task_name in task_names:
