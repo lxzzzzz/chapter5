@@ -109,6 +109,46 @@ class NOVATest(unittest.TestCase):
             self.assertEqual(tuple(batch["box_token_mask"].shape), (2, 3))
             self.assertEqual(batch["box_token_mask"][0].tolist(), [False, True, True])
 
+    def test_train_bev_range_filters_gt_and_detections(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            info_path = f"{tmpdir}/tracking_infos_train.pkl"
+            infos = [
+                _info(0, [(1, _box(0.0)), (2, _box(10.0))]),
+                _info(1, [(1, _box(1.0)), (2, _box(11.0))]),
+            ]
+            with open(info_path, "wb") as f:
+                pickle.dump(infos, f)
+            detections = {
+                ("seq0", "000000"): DetectionFrame(
+                    "seq0",
+                    "000000",
+                    0,
+                    np.stack([_box(0.0), _box(10.0)]).astype(np.float32),
+                    np.asarray([0.9, 0.8], dtype=np.float32),
+                    np.asarray([0, 0], dtype=np.int64),
+                ),
+                ("seq0", "000001"): DetectionFrame(
+                    "seq0",
+                    "000001",
+                    1,
+                    np.stack([_box(1.0), _box(11.0)]).astype(np.float32),
+                    np.asarray([0.9, 0.8], dtype=np.float32),
+                    np.asarray([0, 0], dtype=np.int64),
+                ),
+            }
+
+            full_dataset = NOVAAssociationDataset(_cfg(info_path), split="train", detection_cache=detections)
+            self.assertEqual(len(full_dataset), 4)
+
+            bev_cfg = _cfg(info_path)
+            bev_cfg.nova.bev_range = [0.0, -1.0, 5.0, 1.0]
+            bev_dataset = NOVAAssociationDataset(bev_cfg, split="train", detection_cache=detections)
+            self.assertEqual(len(bev_dataset), 1)
+            sample = bev_dataset[0]
+            self.assertEqual(int(sample["track_id"]), 1)
+            self.assertEqual(int(sample["det_idx"]), 0)
+            self.assertEqual(int(sample["match_label"]), 1)
+
     def test_lifecycle_dataset_labels_and_prompts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             info_path = f"{tmpdir}/tracking_infos_train.pkl"

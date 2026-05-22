@@ -89,6 +89,58 @@ def filter_detection_frame(
     }
 
 
+def _parse_bev_range(value: Any) -> tuple[float, float, float, float] | None:
+    if value is None or value == "":
+        return None
+    values = [float(x) for x in value]
+    if len(values) != 4:
+        raise ValueError(f"nova.bev_range must contain 4 values [x_min, y_min, x_max, y_max], got {value!r}")
+    x_min, y_min, x_max, y_max = values
+    if x_max <= x_min or y_max <= y_min:
+        raise ValueError(f"nova.bev_range has invalid bounds: {value!r}")
+    return x_min, y_min, x_max, y_max
+
+
+def _bev_keep_mask(boxes: np.ndarray, bev_range: tuple[float, float, float, float] | None) -> np.ndarray:
+    boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 7)
+    if bev_range is None:
+        return np.ones((len(boxes),), dtype=np.bool_)
+    x_min, y_min, x_max, y_max = bev_range
+    return (
+        (boxes[:, 0] >= x_min)
+        & (boxes[:, 0] <= x_max)
+        & (boxes[:, 1] >= y_min)
+        & (boxes[:, 1] <= y_max)
+    )
+
+
+def filter_detection_frame_by_bev(frame: DetectionFrame, bev_range: tuple[float, float, float, float] | None) -> DetectionFrame:
+    if bev_range is None:
+        return frame
+    keep = _bev_keep_mask(frame.pred_boxes, bev_range)
+    return DetectionFrame(
+        sequence_id=frame.sequence_id,
+        frame_id=frame.frame_id,
+        frame_idx=frame.frame_idx,
+        pred_boxes=frame.pred_boxes[keep].astype(np.float32),
+        pred_scores=frame.pred_scores[keep].astype(np.float32),
+        pred_labels=frame.pred_labels[keep].astype(np.int64),
+    )
+
+
+def filter_object_frame_by_bev(frame: ObjectFrame, bev_range: tuple[float, float, float, float] | None) -> ObjectFrame:
+    if bev_range is None:
+        return frame
+    keep = _bev_keep_mask(frame.boxes, bev_range)
+    return ObjectFrame(
+        boxes=frame.boxes[keep].astype(np.float32),
+        class_ids=frame.class_ids[keep].astype(np.int64),
+        class_names=frame.class_names[keep],
+        track_ids=frame.track_ids[keep].astype(np.int64),
+        scores=frame.scores[keep].astype(np.float32),
+    )
+
+
 def resolve_detection_cache_path(cfg: Config, split: str) -> Path:
     paths = cfg.detection_cache.get("paths", {})
     configured = paths.get(split, "") if isinstance(paths, dict) else ""
@@ -171,6 +223,7 @@ class NOVAAssociationDataset(Dataset):
         self.history_stride = int(cfg.nova.get("history_stride", 1))
         self.det_gt_iou_threshold = float(cfg.nova.get("det_gt_iou_threshold", 0.5))
         self.negative_positive_ratio = float(cfg.nova.get("negative_positive_ratio", 0.0))
+        self.bev_range = _parse_bev_range(cfg.nova.get("bev_range", None))
         self.formulator = NOVAFormulator(cfg)
 
         with self.info_path.open("rb") as f:
@@ -187,7 +240,10 @@ class NOVAAssociationDataset(Dataset):
             seq: sorted(indices, key=lambda i: int(self.infos[i].get("frame_idx", 0)))
             for seq, indices in self.sequences.items()
         }
-        self._objects_by_global_idx = {idx: frame_to_objects(info, self.class_to_id) for idx, info in enumerate(self.infos)}
+        self._objects_by_global_idx = {
+            idx: filter_object_frame_by_bev(frame_to_objects(info, self.class_to_id), self.bev_range)
+            for idx, info in enumerate(self.infos)
+        }
         self.index: list[NOVAPairIndex] = self._build_pair_index()
 
     def __len__(self) -> int:
@@ -279,7 +335,7 @@ class NOVAAssociationDataset(Dataset):
         key = (str(info.get("sequence_id", "")), str(info.get("frame_id", info.get("frame_idx", ""))))
         if key not in self.detections:
             raise KeyError(f"Detection cache is missing frame {key}")
-        return self.detections[key]
+        return filter_detection_frame_by_bev(self.detections[key], self.bev_range)
 
     def _active_track_ids(self, seq: str, pos: int) -> set[int]:
         active: set[int] = set()
