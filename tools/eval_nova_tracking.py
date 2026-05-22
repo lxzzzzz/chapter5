@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_score_thresh", type=float, default=None, help="Override eval.score_thresh for cached detection filtering.")
     parser.add_argument("--association_threshold", type=float, default=None, help="Override nova.association_threshold for accepting Hungarian matches.")
     parser.add_argument("--max_lost_frames", type=int, default=None, help="Override nova.max_lost_frames hard cap for unmatched tracks.")
+    parser.add_argument("--bev_range", type=float, nargs=4, default=None, metavar=("X_MIN", "Y_MIN", "X_MAX", "Y_MAX"))
     return parser.parse_args()
 
 
@@ -71,6 +72,7 @@ def main() -> None:
         progress_interval=max(1, int(args.progress_interval)),
         use_tqdm=True,
         desc=f"nova eval {args.split}",
+        bev_range=args.bev_range,
     )
     output_path = Path(args.output or Path(cfg.output_dir) / "tracking_results.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +87,7 @@ def main() -> None:
             info_path,
             class_names=list(cfg.dataset.class_names),
             iou_threshold=float(cfg.evaluator.iou_threshold),
+            bev_range=args.bev_range,
             output_path=metrics_path,
         )
         print(
@@ -104,6 +107,7 @@ def main() -> None:
             class_names=list(cfg.dataset.class_names),
             iou_threshold=float(cfg.evaluator.iou_threshold),
             recall_points=int(args.ab3dmot_recall_points),
+            bev_range=args.bev_range,
             output_path=output_ab3d,
         )
         print(

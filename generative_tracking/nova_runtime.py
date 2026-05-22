@@ -392,6 +392,7 @@ def run_nova_tracking(
     progress_interval: int = 50,
     use_tqdm: bool = False,
     desc: str = "nova eval",
+    bev_range: list[float] | tuple[float, float, float, float] | None = None,
 ) -> tuple[list[dict[str, Any]], Path]:
     detections = load_detection_cache(cfg, split)
     info_path = Path(resolve_info_path(cfg, split))
@@ -426,7 +427,7 @@ def run_nova_tracking(
                 pred_labels=np.zeros((0,), dtype=np.int64),
             )
         else:
-            det = filter_eval_detections(det, float(cfg.eval.get("score_thresh", 0.0)))
+            det = filter_eval_detections(det, float(cfg.eval.get("score_thresh", 0.0)), bev_range=bev_range)
         outputs.append(tracker.update(det, model))
         if progress_bar is not None:
             progress_bar.update(1)
@@ -448,6 +449,7 @@ def run_nova_lifecycle_tracking(
     progress_interval: int = 50,
     use_tqdm: bool = False,
     desc: str = "nova lifecycle eval",
+    bev_range: list[float] | tuple[float, float, float, float] | None = None,
 ) -> tuple[list[dict[str, Any]], Path]:
     return _run_nova_tracking_with_tracker(
         cfg=cfg,
@@ -458,6 +460,7 @@ def run_nova_lifecycle_tracking(
         progress_interval=progress_interval,
         use_tqdm=use_tqdm,
         desc=desc,
+        bev_range=bev_range,
         tracker_cls=NOVALifecycleOnlineTracker,
     )
 
@@ -472,6 +475,7 @@ def _run_nova_tracking_with_tracker(
     progress_interval: int,
     use_tqdm: bool,
     desc: str,
+    bev_range: list[float] | tuple[float, float, float, float] | None,
     tracker_cls: type[NOVAOnlineTracker],
 ) -> tuple[list[dict[str, Any]], Path]:
     detections = load_detection_cache(cfg, split)
@@ -506,7 +510,7 @@ def _run_nova_tracking_with_tracker(
                 pred_labels=np.zeros((0,), dtype=np.int64),
             )
         else:
-            det = filter_eval_detections(det, float(cfg.eval.get("score_thresh", 0.0)))
+            det = filter_eval_detections(det, float(cfg.eval.get("score_thresh", 0.0)), bev_range=bev_range)
         outputs.append(tracker.update(det, model))
         if progress_bar is not None:
             progress_bar.update(1)
@@ -518,10 +522,18 @@ def _run_nova_tracking_with_tracker(
     return outputs, info_path
 
 
-def filter_eval_detections(det: DetectionFrame, score_thresh: float) -> DetectionFrame:
-    if score_thresh <= 0.0 or len(det.pred_scores) == 0:
+def filter_eval_detections(
+    det: DetectionFrame,
+    score_thresh: float,
+    bev_range: list[float] | tuple[float, float, float, float] | None = None,
+) -> DetectionFrame:
+    if len(det.pred_scores) == 0:
         return det
-    keep = np.asarray(det.pred_scores >= float(score_thresh), dtype=bool)
+    keep = np.ones((len(det.pred_scores),), dtype=bool)
+    if score_thresh > 0.0:
+        keep &= np.asarray(det.pred_scores >= float(score_thresh), dtype=bool)
+    if bev_range is not None:
+        keep &= _bev_mask(det.pred_boxes, bev_range)
     return DetectionFrame(
         sequence_id=det.sequence_id,
         frame_id=det.frame_id,
@@ -529,4 +541,19 @@ def filter_eval_detections(det: DetectionFrame, score_thresh: float) -> Detectio
         pred_boxes=det.pred_boxes[keep],
         pred_scores=det.pred_scores[keep],
         pred_labels=det.pred_labels[keep],
+    )
+
+
+def _bev_mask(boxes: np.ndarray, bev_range: list[float] | tuple[float, float, float, float]) -> np.ndarray:
+    if len(bev_range) != 4:
+        raise ValueError("bev_range must contain [x_min, y_min, x_max, y_max]")
+    if len(boxes) == 0:
+        return np.zeros((0,), dtype=bool)
+    x_min, y_min, x_max, y_max = [float(value) for value in bev_range]
+    centers = np.asarray(boxes, dtype=np.float32).reshape(-1, 7)[:, :2]
+    return (
+        (centers[:, 0] >= x_min)
+        & (centers[:, 0] <= x_max)
+        & (centers[:, 1] >= y_min)
+        & (centers[:, 1] <= y_max)
     )
