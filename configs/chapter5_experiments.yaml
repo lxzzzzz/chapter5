@@ -28,6 +28,7 @@ datasets:
     split: val
     cache_root: outputs/chapter5/unified_detector/v2x_seq/detection_cache
     table_scope: [comparison]
+    bev_range: [0.0, -11.2, 81.92, 14.4]
   v2x_real:
     paper_name: V2X-Real-I2I
     cfg_file: configs/generative_tracking/ab3dmot_v2x_real.yaml
