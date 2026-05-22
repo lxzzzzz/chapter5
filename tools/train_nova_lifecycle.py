@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from generative_tracking.ab3dmot_evaluator import evaluate_ab3dmot_json
 from generative_tracking.config import load_config
 from generative_tracking.evaluator import evaluate_tracking_json
 from generative_tracking.nova_data import NOVALifecycleDataset, nova_collate
@@ -38,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_full_state", action="store_true")
     parser.add_argument("--eval_score_thresh", type=float, default=None)
     parser.add_argument("--association_threshold", type=float, default=None)
+    parser.add_argument("--max_lost_frames", type=int, default=None)
+    parser.add_argument("--eval_iou_threshold", type=float, default=None)
+    parser.add_argument("--eval_max_frames", type=int, default=None)
+    parser.add_argument("--eval_ab3dmot", action="store_true")
+    parser.add_argument("--ab3dmot_recall_points", type=int, default=40)
+    parser.add_argument("--bev_range", type=float, nargs=4, default=None, metavar=("X_MIN", "Y_MIN", "X_MAX", "Y_MAX"))
     return parser.parse_args()
 
 
@@ -65,6 +72,9 @@ def run_validation(
     output_dir: Path,
     progress_interval: int,
     use_tqdm: bool,
+    bev_range: list[float] | None,
+    eval_ab3dmot: bool,
+    ab3dmot_recall_points: int,
 ) -> dict[str, float]:
     validation_dir = output_dir / "validation"
     validation_dir.mkdir(parents=True, exist_ok=True)
@@ -77,6 +87,7 @@ def run_validation(
         progress_interval=progress_interval,
         use_tqdm=use_tqdm,
         desc=f"nova lifecycle val epoch {epoch}",
+        bev_range=bev_range,
     )
     result_path = validation_dir / f"epoch_{epoch:03d}_tracking_results.json"
     metrics_path = validation_dir / f"epoch_{epoch:03d}_metrics.json"
@@ -87,8 +98,21 @@ def run_validation(
         info_path,
         class_names=list(cfg.dataset.class_names),
         iou_threshold=float(cfg.evaluator.iou_threshold),
+        bev_range=bev_range,
         output_path=metrics_path,
     )
+    if eval_ab3dmot:
+        ab3d_path = validation_dir / f"epoch_{epoch:03d}_metrics_ab3dmot.json"
+        ab3d = evaluate_ab3dmot_json(
+            result_path,
+            info_path,
+            class_names=list(cfg.dataset.class_names),
+            iou_threshold=float(cfg.evaluator.iou_threshold),
+            recall_points=int(ab3dmot_recall_points),
+            bev_range=bev_range,
+            output_path=ab3d_path,
+        )
+        metrics.update({f"ab3dmot_{key}": float(value) for key, value in ab3d.items() if isinstance(value, (int, float))})
     metrics["epoch"] = float(epoch)
     metrics["global_step"] = float(global_step)
     with (validation_dir / "latest_metrics.json").open("w", encoding="utf-8") as f:
@@ -115,6 +139,13 @@ def main() -> None:
         cfg.eval.score_thresh = float(args.eval_score_thresh)
     if args.association_threshold is not None:
         cfg.nova.association_threshold = float(args.association_threshold)
+    if args.max_lost_frames is not None:
+        cfg.nova.max_lost_frames = int(args.max_lost_frames)
+        cfg.eval.max_lost_frames = int(args.max_lost_frames)
+    if args.eval_iou_threshold is not None:
+        cfg.evaluator.iou_threshold = float(args.eval_iou_threshold)
+    if args.eval_max_frames is not None:
+        cfg.train.eval_max_frames = int(args.eval_max_frames)
 
     random.seed(int(cfg.seed))
     np.random.seed(int(cfg.seed))
@@ -163,6 +194,7 @@ def main() -> None:
     )
     use_tqdm = tqdm is not None
     progress_interval = max(1, int(args.progress_interval))
+    validation_bev_range = args.bev_range if args.bev_range is not None else cfg.nova.get("bev_range", None)
     model.train()
     stop = False
     for epoch in range(start_epoch + 1, epochs + 1):
@@ -226,7 +258,19 @@ def main() -> None:
         if epoch_completed and (epoch % eval_interval_epochs == 0 or (bool(cfg.train.get("eval_on_final", True)) and epoch == epochs)):
             was_training = model.training
             model.eval()
-            metrics = run_validation(cfg=cfg, model=model, device=device, epoch=epoch, global_step=global_step, output_dir=output_dir, progress_interval=progress_interval, use_tqdm=use_tqdm)
+            metrics = run_validation(
+                cfg=cfg,
+                model=model,
+                device=device,
+                epoch=epoch,
+                global_step=global_step,
+                output_dir=output_dir,
+                progress_interval=progress_interval,
+                use_tqdm=use_tqdm,
+                bev_range=validation_bev_range,
+                eval_ab3dmot=bool(args.eval_ab3dmot),
+                ab3dmot_recall_points=int(args.ab3dmot_recall_points),
+            )
             if was_training:
                 model.train()
             metric_value = float(metrics.get(best_metric_name, float("nan")))
