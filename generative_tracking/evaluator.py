@@ -17,6 +17,7 @@ def evaluate_tracking_json(
     info_path: str | Path,
     class_names: list[str],
     iou_threshold: float = 0.5,
+    bev_range: list[float] | tuple[float, float, float, float] | None = None,
     output_path: str | Path | None = None,
 ) -> dict[str, float]:
     with Path(result_json).open("r", encoding="utf-8") as f:
@@ -63,24 +64,26 @@ def evaluate_tracking_json(
         pred_boxes = np.asarray([track.get("box3d", [0.0] * 7) for track in pred_tracks], dtype=np.float32).reshape(-1, 7)
         pred_ids = np.asarray([track.get("id", -1) for track in pred_tracks], dtype=np.int64)
         pred_scores = np.asarray([track.get("score", 1.0) for track in pred_tracks], dtype=np.float32).reshape(-1)
+        gt_boxes, gt_track_ids = _filter_gt_by_bev_range(gt.boxes, gt.track_ids.astype(np.int64), bev_range)
+        pred_boxes, pred_ids, pred_scores = _filter_pred_by_bev_range(pred_boxes, pred_ids, pred_scores, bev_range)
 
-        total_gt += len(gt.boxes)
+        total_gt += len(gt_boxes)
         total_pred += len(pred_boxes)
-        for track_id in gt.track_ids.tolist():
+        for track_id in gt_track_ids.tolist():
             gt_key = (seq, int(track_id))
             gt_track_total[gt_key] += 1
             sequence_last_seen[gt_key] = global_frame_idx
 
-        iou = boxes_iou_3d_axis_aligned(gt.boxes, pred_boxes)
+        iou = boxes_iou_3d_axis_aligned(gt_boxes, pred_boxes)
         matches = _match_by_iou(iou, iou_threshold)
         total_matches += len(matches)
-        false_neg += len(gt.boxes) - len(matches)
+        false_neg += len(gt_boxes) - len(matches)
         false_pos += len(pred_boxes) - len(matches)
         motp_iou_sum += sum(score for _gt_idx, _pred_idx, score in matches)
 
         matched_gt_indices = {gt_idx for gt_idx, _pred_idx, _score in matches}
         for gt_idx, pred_idx, _score in matches:
-            gt_key = (seq, int(gt.track_ids[gt_idx]))
+            gt_key = (seq, int(gt_track_ids[gt_idx]))
             pred_id = int(pred_ids[pred_idx]) if pred_idx < len(pred_ids) else -1
             last_pred = gt_to_pred_last.get(gt_key)
             if last_pred is not None and last_pred != pred_id:
@@ -92,7 +95,7 @@ def evaluate_tracking_json(
             gt_track_matched[gt_key] += 1
             gt_track_was_matched[gt_key] = True
 
-        for gt_idx, track_id in enumerate(gt.track_ids.tolist()):
+        for gt_idx, track_id in enumerate(gt_track_ids.tolist()):
             gt_key = (seq, int(track_id))
             if gt_idx not in matched_gt_indices and gt_track_was_matched[gt_key]:
                 gt_track_had_gap[gt_key] = True
@@ -100,7 +103,7 @@ def evaluate_tracking_json(
         frame_records.append(
             {
                 "key": key,
-                "gt_boxes": gt.boxes,
+                "gt_boxes": gt_boxes,
                 "pred_boxes": pred_boxes,
                 "pred_scores": pred_scores,
             }
@@ -140,6 +143,7 @@ def evaluate_tracking_json(
         "false_negative": float(false_neg),
         "iou_threshold": float(iou_threshold),
         "iou_type": "axis_aligned_3d",
+        "bev_range": [float(value) for value in bev_range] if bev_range is not None else None,
     }
     if output_path:
         out = Path(output_path)
@@ -147,6 +151,42 @@ def evaluate_tracking_json(
         with out.open("w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
     return metrics
+
+
+def _bev_mask(boxes: np.ndarray, bev_range: list[float] | tuple[float, float, float, float] | None) -> np.ndarray:
+    if bev_range is None:
+        return np.ones((len(boxes),), dtype=bool)
+    if len(bev_range) != 4:
+        raise ValueError("bev_range must contain [x_min, y_min, x_max, y_max]")
+    if len(boxes) == 0:
+        return np.zeros((0,), dtype=bool)
+    x_min, y_min, x_max, y_max = [float(value) for value in bev_range]
+    centers = np.asarray(boxes, dtype=np.float32).reshape(-1, 7)[:, :2]
+    return (
+        (centers[:, 0] >= x_min)
+        & (centers[:, 0] <= x_max)
+        & (centers[:, 1] >= y_min)
+        & (centers[:, 1] <= y_max)
+    )
+
+
+def _filter_gt_by_bev_range(
+    boxes: np.ndarray,
+    track_ids: np.ndarray,
+    bev_range: list[float] | tuple[float, float, float, float] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    keep = _bev_mask(boxes, bev_range)
+    return boxes[keep], track_ids[keep]
+
+
+def _filter_pred_by_bev_range(
+    boxes: np.ndarray,
+    track_ids: np.ndarray,
+    scores: np.ndarray,
+    bev_range: list[float] | tuple[float, float, float, float] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    keep = _bev_mask(boxes, bev_range)
+    return boxes[keep], track_ids[keep], scores[keep]
 
 
 def _match_by_iou(iou: np.ndarray, threshold: float) -> list[tuple[int, int, float]]:

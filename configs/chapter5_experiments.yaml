@@ -73,7 +73,7 @@ tracking_overrides:
   v2x_real:
     eval_score_thresh: 0.6
     association_threshold: 0.001
-    max_lost_frames: 9
+    max_lost_frames: 2
     high_score_thresh: 0.6
     low_score_thresh: 0.3
 

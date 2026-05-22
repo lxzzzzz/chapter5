@@ -38,9 +38,10 @@ def evaluate_ab3dmot_json(
     class_names: list[str],
     iou_threshold: float = 0.5,
     recall_points: int = 40,
+    bev_range: list[float] | tuple[float, float, float, float] | None = None,
     output_path: str | Path | None = None,
 ) -> dict[str, float | list[dict[str, float]]]:
-    records = _load_records(result_json, info_path, class_names)
+    records = _load_records(result_json, info_path, class_names, bev_range=bev_range)
     full_metrics = _clear_mot_at_threshold(
         records,
         iou_threshold=iou_threshold,
@@ -101,6 +102,7 @@ def evaluate_ab3dmot_json(
         "iou_threshold": float(iou_threshold),
         "recall_points": float(recall_points),
         "iou_type": "axis_aligned_3d",
+        "bev_range": [float(value) for value in bev_range] if bev_range is not None else None,
         "curve": [
             {
                 "target_recall": float(target),
@@ -124,7 +126,13 @@ def evaluate_ab3dmot_json(
     return out
 
 
-def _load_records(result_json: str | Path, info_path: str | Path, class_names: list[str]) -> list[dict[str, Any]]:
+def _load_records(
+    result_json: str | Path,
+    info_path: str | Path,
+    class_names: list[str],
+    *,
+    bev_range: list[float] | tuple[float, float, float, float] | None = None,
+) -> list[dict[str, Any]]:
     with Path(result_json).open("r", encoding="utf-8") as f:
         results = json.load(f)
     with Path(info_path).open("rb") as f:
@@ -145,19 +153,57 @@ def _load_records(result_json: str | Path, info_path: str | Path, class_names: l
         pred_boxes = np.asarray([track.get("box3d", [0.0] * 7) for track in tracks], dtype=np.float32).reshape(-1, 7)
         pred_ids = np.asarray([track.get("id", -1) for track in tracks], dtype=np.int64).reshape(-1)
         pred_scores = np.asarray([track.get("score", 1.0) for track in tracks], dtype=np.float32).reshape(-1)
+        gt_boxes, gt_ids = _filter_gt_by_bev_range(gt.boxes, gt.track_ids.astype(np.int64), bev_range)
+        pred_boxes, pred_ids, pred_scores = _filter_pred_by_bev_range(pred_boxes, pred_ids, pred_scores, bev_range)
         records.append(
             {
                 "sequence_id": seq,
                 "frame_id": frame_id,
                 "frame_idx": int(info.get("frame_idx", 0)),
-                "gt_boxes": gt.boxes,
-                "gt_ids": gt.track_ids.astype(np.int64),
+                "gt_boxes": gt_boxes,
+                "gt_ids": gt_ids,
                 "pred_boxes": pred_boxes,
                 "pred_ids": pred_ids,
                 "pred_scores": pred_scores,
             }
         )
     return records
+
+
+def _bev_mask(boxes: np.ndarray, bev_range: list[float] | tuple[float, float, float, float] | None) -> np.ndarray:
+    if bev_range is None:
+        return np.ones((len(boxes),), dtype=bool)
+    if len(bev_range) != 4:
+        raise ValueError("bev_range must contain [x_min, y_min, x_max, y_max]")
+    if len(boxes) == 0:
+        return np.zeros((0,), dtype=bool)
+    x_min, y_min, x_max, y_max = [float(value) for value in bev_range]
+    centers = np.asarray(boxes, dtype=np.float32).reshape(-1, 7)[:, :2]
+    return (
+        (centers[:, 0] >= x_min)
+        & (centers[:, 0] <= x_max)
+        & (centers[:, 1] >= y_min)
+        & (centers[:, 1] <= y_max)
+    )
+
+
+def _filter_gt_by_bev_range(
+    boxes: np.ndarray,
+    track_ids: np.ndarray,
+    bev_range: list[float] | tuple[float, float, float, float] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    keep = _bev_mask(boxes, bev_range)
+    return boxes[keep], track_ids[keep]
+
+
+def _filter_pred_by_bev_range(
+    boxes: np.ndarray,
+    track_ids: np.ndarray,
+    scores: np.ndarray,
+    bev_range: list[float] | tuple[float, float, float, float] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    keep = _bev_mask(boxes, bev_range)
+    return boxes[keep], track_ids[keep], scores[keep]
 
 
 def _clear_mot_at_threshold(

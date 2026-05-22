@@ -1,0 +1,22 @@
+chapter3_root: /media/ana-4090/LY/chapter3
+detector_cfg_file: /media/ana-4090/LY/chapter3/tools/cfgs/dair_v2x_models/voxelnext_v2x_xian_lidar.yaml
+detector_ckpt: /media/ana-4090/LY/chapter3/output/cfgs/dair_v2x_models/voxelnext_v2x_xian_lidar/default/ckpt/checkpoint_epoch_10.pth
+dataset:
+  name: xian
+  split: train
+  class_names:
+  - Car
+detection_cache:
+  root: /home/lx/chapter5/outputs/chapter5/unified_detector/xian/detection_cache
+  paths: {}
+  score_thresh: 0.05
+  max_dets_per_frame: 100
+  class_name: Car
+eval:
+  score_thresh: 0.6
+  max_lost_frames: 2
+evaluator:
+  enabled: true
+  iou_threshold: 0.5
+  metrics_path: outputs/ab3dmot_xian/tracking_metrics.json
+output_dir: /home/lx/chapter5/outputs/chapter5/runs/_default/xian

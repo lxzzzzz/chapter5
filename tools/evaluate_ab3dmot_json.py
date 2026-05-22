@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=None)
     parser.add_argument("--iou_threshold", type=float, default=None)
     parser.add_argument("--recall_points", type=int, default=40)
+    parser.add_argument("--bev_range", type=float, nargs=4, default=None, metavar=("X_MIN", "Y_MIN", "X_MAX", "Y_MAX"))
     return parser.parse_args()
 
 
@@ -28,6 +29,7 @@ def main() -> None:
         class_names=list(cfg.dataset.class_names),
         iou_threshold=float(args.iou_threshold if args.iou_threshold is not None else cfg.evaluator.iou_threshold),
         recall_points=int(args.recall_points),
+        bev_range=args.bev_range,
         output_path=args.output,
     )
     printable = {key: value for key, value in metrics.items() if key != "curve"}

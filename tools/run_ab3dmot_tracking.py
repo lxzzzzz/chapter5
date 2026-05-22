@@ -192,6 +192,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_metrics", action="store_true")
     parser.add_argument("--eval_ab3dmot", action="store_true")
     parser.add_argument("--ab3dmot_recall_points", type=int, default=40)
+    parser.add_argument("--bev_range", type=float, nargs=4, default=None, metavar=("X_MIN", "Y_MIN", "X_MAX", "Y_MAX"))
     return parser.parse_args()
 
 
@@ -223,6 +224,7 @@ def main() -> None:
         dt_hypotheses=args.dt_hypotheses,
         init_velocity_mode=str(args.init_velocity_mode),
         init_speed_prior=float(args.init_speed_prior),
+        bev_range=args.bev_range,
         max_frames=int(args.max_frames),
         progress_interval=max(1, int(args.progress_interval)),
     )
@@ -245,6 +247,7 @@ def main() -> None:
             info_path,
             class_names=list(cfg.dataset.class_names),
             iou_threshold=eval_iou,
+            bev_range=args.bev_range,
             output_path=metrics_path,
         )
         print(
@@ -264,6 +267,7 @@ def main() -> None:
             class_names=list(cfg.dataset.class_names),
             iou_threshold=eval_iou,
             recall_points=int(args.ab3dmot_recall_points),
+            bev_range=args.bev_range,
             output_path=ab3d_path,
         )
         print(
@@ -291,6 +295,7 @@ def run_ab3dmot(
     dt_hypotheses: list[float] | None,
     init_velocity_mode: str,
     init_speed_prior: float,
+    bev_range: list[float] | tuple[float, float, float, float] | None,
     max_frames: int,
     progress_interval: int,
 ) -> tuple[list[dict[str, Any]], Path]:
@@ -330,7 +335,7 @@ def run_ab3dmot(
                 pred_scores=np.zeros((0,), dtype=np.float32),
                 pred_labels=np.zeros((0,), dtype=np.int64),
             )
-        det = _filter_for_tracking(det, score_thresh=score_thresh, max_dets_per_frame=max_dets_per_frame)
+        det = _filter_for_tracking(det, score_thresh=score_thresh, max_dets_per_frame=max_dets_per_frame, bev_range=bev_range)
         outputs.append(tracker.update(det))
         if progress is not None:
             progress.update(1)
@@ -359,15 +364,29 @@ def _write_runtime_summary(path: Path, *, method: str, frames: int, tracking_sec
         )
 
 
-def _filter_for_tracking(det: DetectionFrame, *, score_thresh: float, max_dets_per_frame: int) -> DetectionFrame:
+def _filter_for_tracking(
+    det: DetectionFrame,
+    *,
+    score_thresh: float,
+    max_dets_per_frame: int,
+    bev_range: list[float] | tuple[float, float, float, float] | None = None,
+) -> DetectionFrame:
+    pred_boxes = det.pred_boxes
+    pred_scores = det.pred_scores
+    pred_labels = det.pred_labels
+    if bev_range is not None:
+        keep = _bev_mask(pred_boxes, bev_range)
+        pred_boxes = pred_boxes[keep]
+        pred_scores = pred_scores[keep]
+        pred_labels = pred_labels[keep]
     frame = filter_detection_frame(
         {
             "sequence_id": det.sequence_id,
             "frame_id": det.frame_id,
             "frame_idx": det.frame_idx,
-            "pred_boxes": det.pred_boxes,
-            "pred_scores": det.pred_scores,
-            "pred_labels": det.pred_labels,
+            "pred_boxes": pred_boxes,
+            "pred_scores": pred_scores,
+            "pred_labels": pred_labels,
         },
         class_id=0,
         score_thresh=score_thresh,
@@ -380,6 +399,21 @@ def _filter_for_tracking(det: DetectionFrame, *, score_thresh: float, max_dets_p
         pred_boxes=np.asarray(frame["pred_boxes"], dtype=np.float32).reshape(-1, 7),
         pred_scores=np.asarray(frame["pred_scores"], dtype=np.float32).reshape(-1),
         pred_labels=np.asarray(frame["pred_labels"], dtype=np.int64).reshape(-1),
+    )
+
+
+def _bev_mask(boxes: np.ndarray, bev_range: list[float] | tuple[float, float, float, float]) -> np.ndarray:
+    if len(bev_range) != 4:
+        raise ValueError("bev_range must contain [x_min, y_min, x_max, y_max]")
+    if len(boxes) == 0:
+        return np.zeros((0,), dtype=bool)
+    x_min, y_min, x_max, y_max = [float(value) for value in bev_range]
+    centers = np.asarray(boxes, dtype=np.float32).reshape(-1, 7)[:, :2]
+    return (
+        (centers[:, 0] >= x_min)
+        & (centers[:, 0] <= x_max)
+        & (centers[:, 1] >= y_min)
+        & (centers[:, 1] <= y_max)
     )
 
 

@@ -170,6 +170,7 @@ def _tracking_command(
         str(metrics.get("recall_points", 40)),
         "--eval_ab3dmot",
     ]
+    _append_bev_range(common, dataset)
     _append_dt_hypotheses(common, defaults)
     _append_motion_prior(common, defaults)
     if runner == "ab3dmot":
@@ -254,6 +255,15 @@ def _append_motion_prior(command: list[str], params: dict[str, Any]) -> None:
     speed = float(params.get("init_speed_prior", 0.0))
     if mode != "zero" or speed > 0:
         command.extend(["--init_velocity_mode", mode, "--init_speed_prior", str(speed)])
+
+
+def _append_bev_range(command: list[str], dataset: dict[str, Any]) -> None:
+    values = dataset.get("bev_range")
+    if values is None:
+        return
+    if not isinstance(values, (list, tuple)) or len(values) != 4:
+        raise ValueError("dataset.bev_range must contain [x_min, y_min, x_max, y_max]")
+    command.extend(["--bev_range", *[str(float(value)) for value in values]])
 
 
 def _materialized_cfg(

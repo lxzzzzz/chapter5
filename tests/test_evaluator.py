@@ -42,6 +42,31 @@ class EvaluatorTest(unittest.TestCase):
             self.assertEqual(metrics["motp"], 1.0)
             self.assertEqual(metrics["id_switches"], 0.0)
 
+    def test_builtin_evaluator_bev_range_filters_gt_and_predictions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            info_path = f"{tmpdir}/infos.pkl"
+            result_path = f"{tmpdir}/result.json"
+            infos = [_info(0, [1, 2])]
+            infos[0]["annos"]["gt_boxes_lidar"][1, 0] = 100.0
+            with open(info_path, "wb") as f:
+                pickle.dump(infos, f)
+            result = [
+                {
+                    "sequence_id": "seq0",
+                    "frame_id": "000000",
+                    "tracks": [
+                        {"id": 7, "class": "Car", "box3d": infos[0]["annos"]["gt_boxes_lidar"][0].tolist(), "score": 1.0},
+                        {"id": 8, "class": "Car", "box3d": infos[0]["annos"]["gt_boxes_lidar"][1].tolist(), "score": 1.0},
+                    ],
+                }
+            ]
+            with open(result_path, "w", encoding="utf-8") as f:
+                json.dump(result, f)
+            metrics = evaluate_tracking_json(result_path, info_path, ["Car"], iou_threshold=0.5, bev_range=[-1.0, -1.0, 1.0, 1.0])
+            self.assertEqual(metrics["num_gt"], 1.0)
+            self.assertEqual(metrics["num_pred"], 1.0)
+            self.assertEqual(metrics["mota"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
