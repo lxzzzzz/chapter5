@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_score_thresh", type=float, default=None)
     parser.add_argument("--association_threshold", type=float, default=None)
     parser.add_argument("--max_lost_frames", type=int, default=None)
+    parser.add_argument("--detection_cache_root", default=None, help="Override detection_cache.root for evaluation.")
     parser.add_argument("--bev_range", type=float, nargs=4, default=None, metavar=("X_MIN", "Y_MIN", "X_MAX", "Y_MAX"))
     return parser.parse_args()
 
@@ -45,6 +46,9 @@ def main() -> None:
     if args.max_lost_frames is not None:
         cfg.nova.max_lost_frames = int(args.max_lost_frames)
         cfg.eval.max_lost_frames = int(args.max_lost_frames)
+    if args.detection_cache_root is not None:
+        cfg.detection_cache.root = str(args.detection_cache_root)
+        cfg.detection_cache.paths = {}
     device = select_device(str(cfg.device))
     model = NOVALifecycleModel(cfg).to(device)
     ckpt_arg = args.ckpt if args.ckpt is not None else str(cfg.eval.get("checkpoint", ""))
