@@ -295,6 +295,28 @@ class NOVATest(unittest.TestCase):
         self.assertEqual([track["id"] for track in out2["tracks"]], [0])
         self.assertEqual(tracker.tracks[1].lost_frames, 1)
 
+    def test_v1_output_score_can_keep_detector_score(self):
+        frame = DetectionFrame(
+            "seq0",
+            "000000",
+            0,
+            np.stack([_box(0.0)]),
+            np.asarray([0.8], dtype=np.float32),
+            np.asarray([0], dtype=np.int64),
+        )
+        default_cfg = load_config(overrides={"dataset": {"class_names": ["Car"]}})
+        default_tracker = NOVAOnlineTracker(default_cfg, torch.device("cpu"))
+        self.assertAlmostEqual(default_tracker._output_track(0, frame, 0, 0.5)["score"], 0.4, places=5)
+
+        detector_cfg = load_config(
+            overrides={
+                "dataset": {"class_names": ["Car"]},
+                "nova": {"output_score_mode": "detector"},
+            }
+        )
+        detector_tracker = NOVAOnlineTracker(detector_cfg, torch.device("cpu"))
+        self.assertAlmostEqual(detector_tracker._output_track(0, frame, 0, 0.5)["score"], 0.8, places=5)
+
     def test_lifecycle_runtime_birth_keep_end_and_hard_cap(self):
         cfg = load_config(
             overrides={

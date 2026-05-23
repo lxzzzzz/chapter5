@@ -135,7 +135,14 @@ class NOVAOnlineTracker:
     def _output_track(self, track_id: int, det: DetectionFrame, det_idx: int, match_score: float) -> dict[str, Any]:
         class_id = int(det.pred_labels[det_idx])
         class_name = self.class_names[class_id] if 0 <= class_id < len(self.class_names) else "Unknown"
-        score = float(det.pred_scores[det_idx]) * max(float(match_score), 0.0)
+        det_score = float(det.pred_scores[det_idx])
+        score_mode = str(self.cfg.nova.get("output_score_mode", "det_assoc_product")).lower()
+        if score_mode in {"detector", "det", "detection"}:
+            score = det_score
+        elif score_mode in {"match", "association", "assoc"}:
+            score = max(float(match_score), 0.0)
+        else:
+            score = det_score * max(float(match_score), 0.0)
         return {
             "id": int(track_id),
             "class": str(class_name),

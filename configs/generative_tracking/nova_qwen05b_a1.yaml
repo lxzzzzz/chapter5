@@ -28,6 +28,7 @@ nova:
   max_lost_frames: 2
   geometry_hidden_size: 128
   negative_positive_ratio: 3.0
+  output_score_mode: detector
   box_token: <box>
   yes_token: "Yes"
   no_token: "No"
